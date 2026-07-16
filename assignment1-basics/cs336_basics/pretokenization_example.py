@@ -1,5 +1,9 @@
 import os
+import regex as re
 from typing import BinaryIO
+import collections
+import multiprocessing
+import time
 
 
 def find_chunk_boundaries(
@@ -49,14 +53,56 @@ def find_chunk_boundaries(
     return sorted(set(chunk_boundaries))
 
 
-## Usage
-with open(..., "rb") as f:
-    num_processes = 4
-    boundaries = find_chunk_boundaries(f, num_processes, b"<|endoftext|>")
+def find_file_chunk_boundaries(
+    file_path: str,
+    num_processes: int,
+) -> list[int]:
+    with open(file_path, "rb") as f:
+        return find_chunk_boundaries(f, num_processes, b"<|endoftext|>")
 
-    # The following is a serial implementation, but you can parallelize this
-    # by sending each start/end pair to a set of processes.
-    for start, end in zip(boundaries[:-1], boundaries[1:]):
+
+def pretokenize(file_path: str, start: int, end: int) -> dict[str, int]:
+    with open(file_path, "rb") as f:
         f.seek(start)
         chunk = f.read(end - start).decode("utf-8", errors="ignore")
-        # Run pre-tokenization on your chunk and store the counts for each pre-token
+        PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
+        return dict(collections.Counter(re.findall(PAT, chunk)))
+
+
+def parallel_pretokenize(file_path: str, num_processes: int) -> None:
+    """
+    Pre-tokenize a file into chunks that can be counted independently.
+    """
+    t0 = time.perf_counter()
+    boundaries = find_file_chunk_boundaries(file_path, num_processes)
+    jobs = [(file_path, start, end) for start, end in zip(boundaries[:-1], boundaries[1:])]
+    with multiprocessing.Pool() as pool:
+        partial_counts = pool.starmap(pretokenize, jobs)
+
+    total_counts = collections.Counter()
+    for partial_count in partial_counts:
+        total_counts.update(partial_count)
+
+    t1 = time.perf_counter()
+    print(f"Elapsed: {t1 - t0}s")
+    print("Top 10 Pretoken Counts:")
+    from itertools import islice
+
+    first_10 = dict(islice(total_counts.items(), 10))
+    for pretoken, count in first_10.items():
+        print(f"{pretoken!r}: {count}")
+
+    return total_counts
+
+
+## Usage
+# with open(..., "rb") as f:
+#     num_processes = 4
+#     boundaries = find_chunk_boundaries(f, num_processes, b"<|endoftext|>")
+
+#     # The following is a serial implementation, but you can parallelize this
+#     # by sending each start/end pair to a set of processes.
+#     for start, end in zip(boundaries[:-1], boundaries[1:]):
+#         f.seek(start)
+#         chunk = f.read(end - start).decode("utf-8", errors="ignore")
+#         # Run pre-tokenization on your chunk and store the counts for each pre-token
