@@ -6,18 +6,21 @@ from typing import BinaryIO, Collection
 
 import regex as re
 
+SPLIT_TOKEN = "<|endoftext|>"
+
 
 def find_chunk_boundaries(
     file: BinaryIO,
     desired_num_chunks: int,
-    split_special_token: bytes,
+    split_token: str,
 ) -> list[int]:
     """
     Chunk the file into parts that can be counted independently.
     May return fewer chunks if the boundaries end up overlapping.
     """
+    split_token_bytes = split_token.encode("utf-8")
     assert isinstance(
-        split_special_token, bytes
+        split_token_bytes, bytes
     ), "Must represent special token as a bytestring"
 
     # Get total file size in bytes
@@ -46,7 +49,7 @@ def find_chunk_boundaries(
                 break
 
             # Find the special token in the mini chunk
-            found_at = mini_chunk.find(split_special_token)
+            found_at = mini_chunk.find(split_token_bytes)
             if found_at != -1:
                 chunk_boundaries[bi] = initial_position + found_at
                 break
@@ -61,18 +64,24 @@ def find_file_chunk_boundaries(
     desired_num_chunks: int,
 ) -> list[int]:
     with open(file_path, "rb") as f:
-        return find_chunk_boundaries(f, desired_num_chunks, b"<|endoftext|>")
+        return find_chunk_boundaries(f, desired_num_chunks, SPLIT_TOKEN)
 
 
-def pretokenize(file_path: str, start: int, end: int) -> dict[str, int]:
+def pretokenize(s: str) -> dict[str, int]:
+    # TODO: chunk need to split with |<endoftext>|
+
+    PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
+    counts = collections.Counter()
+    for m in re.finditer(PAT, s):
+        counts[m.group()] += 1
+    return dict(counts)
+
+
+def pretokenize_chunk(file_path: str, start: int, end: int) -> dict[str, int]:
     with open(file_path, "rb") as f:
         f.seek(start)
         chunk = f.read(end - start).decode("utf-8", errors="ignore")
-        PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
-        counts = collections.Counter()
-        for m in re.finditer(PAT, chunk):
-            counts[m.group()] += 1
-        return dict(counts)
+        return pretokenize(chunk)
 
 
 def parallel_pretokenize(file_path: str, num_processes: int) -> dict[str, int]:
@@ -81,11 +90,11 @@ def parallel_pretokenize(file_path: str, num_processes: int) -> dict[str, int]:
     """
     t0 = time.perf_counter()
     boundaries = find_file_chunk_boundaries(file_path, num_processes)
-    jobs = [
+    chunks = [
         (file_path, start, end) for start, end in zip(boundaries[:-1], boundaries[1:])
     ]
     with multiprocessing.Pool(num_processes) as pool:
-        partial_counts = pool.starmap(pretokenize, jobs)
+        partial_counts = pool.starmap(pretokenize_chunk, chunks)
 
     total_counts = collections.Counter()
     for partial_count in partial_counts:
