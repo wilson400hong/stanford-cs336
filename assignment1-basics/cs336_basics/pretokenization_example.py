@@ -1,9 +1,10 @@
-import os
-import regex as re
-from typing import BinaryIO
 import collections
 import multiprocessing
+import os
 import time
+from typing import BinaryIO, Collection
+
+import regex as re
 
 
 def find_chunk_boundaries(
@@ -15,7 +16,9 @@ def find_chunk_boundaries(
     Chunk the file into parts that can be counted independently.
     May return fewer chunks if the boundaries end up overlapping.
     """
-    assert isinstance(split_special_token, bytes), "Must represent special token as a bytestring"
+    assert isinstance(
+        split_special_token, bytes
+    ), "Must represent special token as a bytestring"
 
     # Get total file size in bytes
     file.seek(0, os.SEEK_END)
@@ -66,17 +69,22 @@ def pretokenize(file_path: str, start: int, end: int) -> dict[str, int]:
         f.seek(start)
         chunk = f.read(end - start).decode("utf-8", errors="ignore")
         PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
-        return dict(collections.Counter(re.findall(PAT, chunk)))
+        counts = collections.Counter()
+        for m in re.finditer(PAT, chunk):
+            counts[m.group()] += 1
+        return dict(counts)
 
 
-def parallel_pretokenize(file_path: str, num_processes: int) -> None:
+def parallel_pretokenize(file_path: str, num_processes: int) -> dict[str, int]:
     """
     Pre-tokenize a file into chunks that can be counted independently.
     """
     t0 = time.perf_counter()
     boundaries = find_file_chunk_boundaries(file_path, num_processes)
-    jobs = [(file_path, start, end) for start, end in zip(boundaries[:-1], boundaries[1:])]
-    with multiprocessing.Pool() as pool:
+    jobs = [
+        (file_path, start, end) for start, end in zip(boundaries[:-1], boundaries[1:])
+    ]
+    with multiprocessing.Pool(num_processes) as pool:
         partial_counts = pool.starmap(pretokenize, jobs)
 
     total_counts = collections.Counter()
@@ -85,14 +93,14 @@ def parallel_pretokenize(file_path: str, num_processes: int) -> None:
 
     t1 = time.perf_counter()
     print(f"Elapsed: {t1 - t0}s")
-    print("Top 10 Pretoken Counts:")
+    print("First 10 Pretoken Counts:")
     from itertools import islice
 
     first_10 = dict(islice(total_counts.items(), 10))
     for pretoken, count in first_10.items():
         print(f"{pretoken!r}: {count}")
 
-    return total_counts
+    return dict(total_counts)
 
 
 ## Usage
