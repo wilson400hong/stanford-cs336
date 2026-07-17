@@ -8,9 +8,13 @@ import regex as re
 
 SPLIT_TOKEN = "<|endoftext|>"
 
+PRETOKENIZE_PAT = (
+    r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
+)
 
-def find_chunk_boundaries(
-    file: BinaryIO,
+
+def get_chunk_boundaries(
+    input_path: str,
     desired_num_chunks: int,
     split_token: str,
 ) -> list[int]:
@@ -23,75 +27,75 @@ def find_chunk_boundaries(
         split_token_bytes, bytes
     ), "Must represent special token as a bytestring"
 
-    # Get total file size in bytes
-    file.seek(0, os.SEEK_END)
-    file_size = file.tell()
-    file.seek(0)
+    with open(input_path, "rb") as file:
+        # Get total file size in bytes
+        file.seek(0, os.SEEK_END)
+        file_size = file.tell()
+        file.seek(0)
 
-    chunk_size = file_size // desired_num_chunks
+        chunk_size = file_size // desired_num_chunks
 
-    # Initial guesses for chunk boundary locations, uniformly spaced
-    # Chunks start on previous index, don't include last index
-    chunk_boundaries = [i * chunk_size for i in range(desired_num_chunks + 1)]
-    chunk_boundaries[-1] = file_size
+        # Initial guesses for chunk boundary locations, uniformly spaced
+        # Chunks start on previous index, don't include last index
+        chunk_boundaries = [i * chunk_size for i in range(desired_num_chunks + 1)]
+        chunk_boundaries[-1] = file_size
 
-    mini_chunk_size = 4096  # Read ahead by 4k bytes at a time
+        mini_chunk_size = 4096  # Read ahead by 4k bytes at a time
 
-    for bi in range(1, len(chunk_boundaries) - 1):
-        initial_position = chunk_boundaries[bi]
-        file.seek(initial_position)  # Start at boundary guess
-        while True:
-            mini_chunk = file.read(mini_chunk_size)  # Read a mini chunk
+        for bi in range(1, len(chunk_boundaries) - 1):
+            initial_position = chunk_boundaries[bi]
+            file.seek(initial_position)  # Start at boundary guess
+            while True:
+                mini_chunk = file.read(mini_chunk_size)  # Read a mini chunk
 
-            # If EOF, this boundary should be at the end of the file
-            if mini_chunk == b"":
-                chunk_boundaries[bi] = file_size
-                break
+                # If EOF, this boundary should be at the end of the file
+                if mini_chunk == b"":
+                    chunk_boundaries[bi] = file_size
+                    break
 
-            # Find the special token in the mini chunk
-            found_at = mini_chunk.find(split_token_bytes)
-            if found_at != -1:
-                chunk_boundaries[bi] = initial_position + found_at
-                break
-            initial_position += mini_chunk_size
+                # Find the special token in the mini chunk
+                found_at = mini_chunk.find(split_token_bytes)
+                if found_at != -1:
+                    chunk_boundaries[bi] = initial_position + found_at
+                    break
+                initial_position += mini_chunk_size
 
-    # Make sure all boundaries are unique, but might be fewer than desired_num_chunks
-    return sorted(set(chunk_boundaries))
-
-
-def find_file_chunk_boundaries(
-    file_path: str,
-    desired_num_chunks: int,
-) -> list[int]:
-    with open(file_path, "rb") as f:
-        return find_chunk_boundaries(f, desired_num_chunks, SPLIT_TOKEN)
+        # Make sure all boundaries are unique, but might be fewer than desired_num_chunks
+        return sorted(set(chunk_boundaries))
 
 
-def pretokenize(s: str) -> dict[str, int]:
-    # TODO: chunk need to split with |<endoftext>|
-
-    PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
+def pretokenize_str(s: str, special_tokens: list[str]) -> dict[str, int]:
+    pattern = "|".join([re.escape(token) for token in special_tokens])
     counts = collections.Counter()
-    for m in re.finditer(PAT, s):
-        counts[m.group()] += 1
+    parts = re.split(pattern, s)  # use s.split() if too slow
+    for part in parts:
+        for m in re.finditer(PRETOKENIZE_PAT, part):
+            counts[m.group()] += 1
     return dict(counts)
 
 
-def pretokenize_chunk(file_path: str, start: int, end: int) -> dict[str, int]:
+def pretokenize_chunk(
+    file_path: str, start: int, end: int, special_tokens: list[str]
+) -> dict[str, int]:
     with open(file_path, "rb") as f:
         f.seek(start)
         chunk = f.read(end - start).decode("utf-8", errors="ignore")
-        return pretokenize(chunk)
+        return pretokenize_str(chunk, special_tokens)
 
 
-def parallel_pretokenize(file_path: str, num_processes: int) -> dict[str, int]:
+def parallel_pretokenize(
+    input_path: str, num_processes: int, special_tokens: list[str]
+) -> dict[str, int]:
     """
     Pre-tokenize a file into chunks that can be counted independently.
     """
     t0 = time.perf_counter()
-    boundaries = find_file_chunk_boundaries(file_path, num_processes)
+    boundaries = get_chunk_boundaries(
+        input_path, num_processes, split_token=SPLIT_TOKEN
+    )
     chunks = [
-        (file_path, start, end) for start, end in zip(boundaries[:-1], boundaries[1:])
+        (input_path, start, end, special_tokens)
+        for start, end in zip(boundaries[:-1], boundaries[1:])
     ]
     with multiprocessing.Pool(num_processes) as pool:
         partial_counts = pool.starmap(pretokenize_chunk, chunks)
@@ -102,6 +106,8 @@ def parallel_pretokenize(file_path: str, num_processes: int) -> dict[str, int]:
 
     t1 = time.perf_counter()
     print(f"Elapsed: {t1 - t0}s")
+
+    # DEBUG
     print("First 10 Pretoken Counts:")
     from itertools import islice
 
@@ -109,7 +115,7 @@ def parallel_pretokenize(file_path: str, num_processes: int) -> dict[str, int]:
     for pretoken, count in first_10.items():
         print(f"{pretoken!r}: {count}")
 
-    return dict(total_counts)
+    return sorted(dict(total_counts))  # TODO: sorted to ensure correctness
 
 
 BytesTuple = tuple[bytes, ...]
@@ -126,6 +132,16 @@ def counts_to_bt(counts: dict[str, int]) -> dict[tuple[bytes], int]:
 
 def bt_to_bp(bt: BytesTuple) -> list[BytesPair]:
     return list(zip(bt[:-1], bt[1:]))
+
+
+# def run_train_bpe(
+#     input_path: str | os.PathLike,
+#     vocab_size: int,
+#     special_tokens: list[str],
+#     **kwargs,
+# ) -> tuple[dict[int, bytes], list[tuple[bytes, bytes]]]:
+#     num_processes = 16
+#     pretoken_counts = parallel_pretokenize(input_path, num_processes, special_tokens)
 
 
 # class BPETokenizer:
