@@ -1,8 +1,10 @@
 import collections
+
+# from typing import BinaryIO, Collection
+import json
 import multiprocessing
 import os
 import time
-from typing import BinaryIO, Collection
 
 import regex as re
 
@@ -11,6 +13,8 @@ SPLIT_TOKEN = "<|endoftext|>"
 PRETOKENIZE_PAT = (
     r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
 )
+
+NPROC = 16
 
 
 def get_chunk_boundaries(
@@ -89,6 +93,8 @@ def parallel_pretokenize(
     """
     Pre-tokenize a file into chunks that can be counted independently.
     """
+    print("parallel_pretokenize start...")
+    t0 = time.perf_counter()
     boundaries = get_chunk_boundaries(
         input_path, num_processes, split_token=SPLIT_TOKEN
     )
@@ -112,7 +118,8 @@ def parallel_pretokenize(
     # first_10 = dict(islice(total_counts.items(), 10))
     # for pretoken, count in first_10.items():
     #     print(f"{pretoken!r}: {count}")
-
+    t1 = time.perf_counter()
+    print(f"parallel_pretokenize done. elapsed: {t1 - t0}s")
     return total_counts
 
 
@@ -124,12 +131,8 @@ def str_to_bt(s: str) -> BytesTuple:
     return tuple(bytes([b]) for b in s.encode("utf-8"))
 
 
-def counts_to_bt(counts: dict[str, int]) -> dict[tuple[bytes], int]:
-    return {str_to_bt(k): v for k, v in counts.items()}
-
-
 def bt_to_bps(bt: BytesTuple) -> list[BytesPair]:
-    return list(zip(bt[:-1], bt[1:]))
+    return list(zip(bt, bt[1:]))  # same as zip(bt[:-1], bt[1:])
 
 
 def get_max_bp(bp_counts: dict[BytesPair, int]) -> BytesPair:
@@ -148,13 +151,146 @@ def merge_bp(bt: BytesTuple, bp: BytesPair) -> BytesTuple:
     n = len(bt)
     i = 0
     while i < n:
-        if i < n - 1 and (bt[i], bt[i + 1]) == bp:
+        if i < n - 1 and bt[i] == bp[0] and bt[i + 1] == bp[1]:
             merged.append(bt[i] + bt[i + 1])
             i += 2
         else:
             merged.append(bt[i])
             i += 1
     return tuple(merged)
+
+
+# TODO: optimization
+def test_build_vocab(
+    file_path: str,
+    vocab_size: int,
+    special_tokens: list[str],
+    **kwargs,
+) -> tuple[dict[int, bytes], list[BytesPair]]:
+    with open(file_path, "r") as f:
+        pretoken_to_count = json.load(f)
+
+    print("load pretoken_to_count done")
+
+    # initialize vacab
+    t0 = time.perf_counter()
+    vocab: dict[int, bytes] = {}
+    for special_token in special_tokens:
+        vocab[len(vocab)] = special_token.encode("utf-8")
+    for b in range(256):
+        vocab[len(vocab)] = bytes([b])
+
+    t1 = time.perf_counter()
+    print(f"init vocab done. elapsed: {t1-t0:.6f}s")
+
+    # NIT: merge into one dict to simplify
+    # NOTE: now pretoken use idx (int)
+
+    pretoken_counts = [pretoken_to_count[pretoken] for pretoken in pretoken_to_count]
+    pretoken_to_bt = [str_to_bt(pretoken) for pretoken in pretoken_to_count]
+
+    # NIT: merge into one dict to simplify
+    bp_to_count: dict[BytesPair, int] = collections.defaultdict(int)
+    bp_to_pretokens: dict[BytesPair, set[int]] = collections.defaultdict(set)
+
+    t2 = time.perf_counter()
+    print(f"init pretoken_to_bt done. elapsed: {t2-t1:.6f}s")
+
+    merges: list[BytesPair] = []
+
+    for pretoken, bt in enumerate(pretoken_to_bt):
+        cnt = pretoken_counts[pretoken]
+        bps = bt_to_bps(bt)
+        for bp in bps:
+            bp_to_count[bp] += cnt
+            bp_to_pretokens[bp].add(pretoken)
+
+    t3 = time.perf_counter()
+    print(f"init bp_to_count and bp_to_pretokens done. elapsed: {t3-t2:.6f}s")
+
+    # mergeing
+    print("start merging...")
+    while len(vocab) < vocab_size:
+        print(f"  round #{len(merges)}")
+
+        # get max BP to merge
+        t10 = time.perf_counter()
+        bp_to_merge = get_max_bp(bp_to_count)
+        t11 = time.perf_counter()
+        print(f"  get_max_bp: elapsed {t11-t10:.6f}s")
+
+        # update merges and vocab
+        merges.append(bp_to_merge)
+        vocab[len(vocab)] = bp_to_merge[0] + bp_to_merge[1]
+        t12 = time.perf_counter()
+        print(f"  update merges and vocab: elapsed {t12-t11:.6f}s")
+
+        affected_pretokens = bp_to_pretokens[bp_to_merge].copy()
+        latencies = collections.defaultdict(float)
+        # TODO: this part toooooo slow
+        for pretoken in affected_pretokens:
+            ta = time.perf_counter()
+            cnt = pretoken_counts[pretoken]
+            old_bt = pretoken_to_bt[pretoken]
+            old_bps = bt_to_bps(old_bt)
+            tb = time.perf_counter()
+
+            latencies["old_bps"] += tb - ta
+
+            new_bt = merge_bp(old_bt, bp_to_merge)
+            tc = time.perf_counter()
+            latencies["new_bt"] += tc - tb
+
+            new_bps = bt_to_bps(new_bt)
+            td = time.perf_counter()
+
+            latencies["new_bps"] += td - tc
+
+            pretoken_to_bt[pretoken] = new_bt
+
+            # update bp_to_count to bp_to_pretokens
+            bp_delta: dict[bytes, int] = collections.defaultdict(int)
+            for bp in new_bps:
+                bp_delta[bp] += 1
+            for bp in old_bps:
+                bp_delta[bp] -= 1
+
+            for bp, delta in bp_delta.items():
+                if delta == 0:
+                    continue
+                bp_to_count[bp] += cnt * delta
+
+            old_bps_set = set(old_bps)
+            new_bps_set = set(new_bps)
+            to_remove = old_bps_set - new_bps_set
+            to_add = new_bps_set - old_bps_set
+            for bp in to_remove:
+                if pretoken in bp_to_pretokens[bp]:
+                    bp_to_pretokens[bp].remove(pretoken)
+            for bp in to_add:
+                bp_to_pretokens[bp].add(pretoken)
+            # for bp in old_bps:
+            #     if pretoken in bp_to_pretokens[bp]:
+            #         bp_to_pretokens[bp].remove(pretoken)
+            #     bp_to_count[bp] -= cnt
+
+            # for bp in new_bps:
+            #     bp_to_pretokens[bp].add(pretoken)
+            #     bp_to_count[bp] += cnt
+
+            te = time.perf_counter()
+            latencies["bp_to_count and bp_to_pretokens"] += te - td
+
+        t13 = time.perf_counter()
+        print(
+            f"  update affected_pretokens {len(affected_pretokens)} elapsed {t13-t12:.6f}s, latencies: {latencies}"
+        )
+
+    t4 = time.perf_counter()
+
+    print(f"all done . Elapsed: {t4 - t3}s")
+    print(f"vocab size: {len(vocab)}, merges size: {len(merges)}")
+    return vocab, merges
 
 
 def train_bpe(
@@ -164,10 +300,10 @@ def train_bpe(
     **kwargs,
 ) -> tuple[dict[int, bytes], list[BytesPair]]:
     # 1. get pretoken counts
-    num_processes = 16
+
     print("Running pretokenization...")
     t0 = time.perf_counter()
-    pretoken_to_count = parallel_pretokenize(input_path, num_processes, special_tokens)
+    pretoken_to_count = parallel_pretokenize(input_path, NPROC, special_tokens)
     t1 = time.perf_counter()
     print(f"Parallel pretokenization done. Elapsed: {t1 - t0}s")
 
@@ -216,27 +352,68 @@ def train_bpe(
             pretoken_to_bt[pretoken] = new_bt
 
             # update bp_to_count to bp_to_pretokens
+            bp_delta: dict[bytes, int] = collections.defaultdict(int)
+            for bp in new_bps:
+                bp_delta[bp] += 1
             for bp in old_bps:
+                bp_delta[bp] -= 1
+
+            for bp, delta in bp_delta.items():
+                if delta == 0:
+                    continue
+                bp_to_count[bp] += cnt * delta
+
+            old_bps_set = set(old_bps)
+            new_bps_set = set(new_bps)
+            to_remove = old_bps_set - new_bps_set
+            to_add = new_bps_set - old_bps_set
+            for bp in to_remove:
                 if pretoken in bp_to_pretokens[bp]:
                     bp_to_pretokens[bp].remove(pretoken)
-                bp_to_count[bp] -= cnt
-
-            for bp in new_bps:
+            for bp in to_add:
                 bp_to_pretokens[bp].add(pretoken)
-                bp_to_count[bp] += cnt
-            
+
+            # for bp in old_bps:
+            #     if pretoken in bp_to_pretokens[bp]:
+            #         bp_to_pretokens[bp].remove(pretoken)
+            #     bp_to_count[bp] -= cnt
+
+            # for bp in new_bps:
+            #     bp_to_pretokens[bp].add(pretoken)
+            #     bp_to_count[bp] += cnt
+
     t3 = time.perf_counter()
     print(f"vocab size: {len(vocab)}, merges size: {len(merges)}")
     print(f"BPE training done. Elapsed: {t3 - t2}s")
     return vocab, merges
 
 
-# class BPETokenizer:
-#     def __init__(self):
-#         pass
+class BPETokenizer:
+    def __init__(
+        self,
+        vocab: dict[int, bytes],
+        merges: list[tuple[bytes, bytes]],
+        special_tokens: list[str] | None = None,
+    ):
+        self.vocab = vocab
+        self.merges = merges
+        self.special_tokens = special_tokens
+        self.index: dict[bytes, int] = {v: k for k, v in self.vocab.items()}
 
-#     def encode(self):
-#         pass
+    @classmethod
+    def from_files(
+        cls,
+        vocab_filepath: str,
+        merges_filepath: str,
+        special_tokens: list[str] | None = None,
+    ):
+        vocab = json.load(open(vocab_filepath, "r"))
+        merges = json.load(open(merges_filepath, "r"))
+        return cls(vocab, merges, special_tokens)
 
-#     def decode(self):
-#         pass
+    def encode(self, text: str) -> list[int]:
+        # 1. split
+        raise NotImplementedError("")
+
+    def decode(self, ids: list[int]) -> str:
+        raise NotImplementedError("")
