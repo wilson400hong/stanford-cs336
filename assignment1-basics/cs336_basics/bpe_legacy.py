@@ -1,7 +1,5 @@
 import collections
 import heapq
-
-# from typing import BinaryIO, Collection
 import json
 import multiprocessing
 import os
@@ -356,101 +354,6 @@ def train_bpe(
     pretoken_to_count = parallel_pretokenize(input_path, NPROC, special_tokens)
 
     return build_vocab_merges(pretoken_to_count, vocab_size, special_tokens)
-
-
-# def train_bpe(
-#     input_path: str | os.PathLike,
-#     vocab_size: int,
-#     special_tokens: list[str],
-#     **kwargs,
-# ) -> tuple[dict[int, bytes], list[BytesPair]]:
-#     # 1. get pretoken counts
-
-#     print("Running pretokenization...")
-#     t0 = time.perf_counter()
-#     pretoken_to_count = parallel_pretokenize(input_path, NPROC, special_tokens)
-#     t1 = time.perf_counter()
-#     print(f"Parallel pretokenization done. Elapsed: {t1 - t0}s")
-
-#     # 2. initialize vacab
-#     vocab: dict[int, bytes] = {}
-#     for special_token in special_tokens:
-#         vocab[len(vocab)] = special_token.encode("utf-8")
-#     for b in range(256):
-#         vocab[len(vocab)] = bytes([b])
-
-#     # NIT: merge into one dict to simplify
-#     pretoken_to_bt = {pretoken: str_to_bt(pretoken) for pretoken in pretoken_to_count}
-#     # NIT: merge into one dict to simplify
-#     bp_to_count: dict[BytesPair, int] = collections.defaultdict(int)
-#     bp_to_pretokens: dict[BytesPair, set[str]] = collections.defaultdict(set)
-
-#     # 3. train & merge
-#     merges: list[BytesPair] = []
-#     print("Running BPE training...")
-#     t2 = time.perf_counter()
-#     for pretoken, bt in pretoken_to_bt.items():
-#         cnt = pretoken_to_count[pretoken]
-#         bps = bt_to_bps(bt)
-#         for bp in bps:
-#             bp_to_count[bp] += cnt
-#             bp_to_pretokens[bp].add(pretoken)
-
-#     while len(vocab) < vocab_size:
-#         # get max BP to merge
-#         bp_to_merge = get_max_bp(bp_to_count)
-#         print(f"  round #{len(merges)}: merging {bp_to_merge}")
-
-#         # update merges and vocab
-#         merges.append(bp_to_merge)
-#         vocab[len(vocab)] = bp_to_merge[0] + bp_to_merge[1]
-
-#         affected_pretokens = bp_to_pretokens[bp_to_merge].copy()
-#         for pretoken in affected_pretokens:
-#             cnt = pretoken_to_count[pretoken]
-#             old_bt = pretoken_to_bt[pretoken]
-#             old_bps = bt_to_bps(old_bt)
-
-#             new_bt = merge_bp(old_bt, bp_to_merge)
-#             new_bps = bt_to_bps(new_bt)
-
-#             pretoken_to_bt[pretoken] = new_bt
-
-#             # update bp_to_count to bp_to_pretokens
-#             bp_delta: dict[bytes, int] = collections.defaultdict(int)
-#             for bp in new_bps:
-#                 bp_delta[bp] += 1
-#             for bp in old_bps:
-#                 bp_delta[bp] -= 1
-
-#             for bp, delta in bp_delta.items():
-#                 if delta == 0:
-#                     continue
-#                 bp_to_count[bp] += cnt * delta
-
-#             old_bps_set = set(old_bps)
-#             new_bps_set = set(new_bps)
-#             to_remove = old_bps_set - new_bps_set
-#             to_add = new_bps_set - old_bps_set
-#             for bp in to_remove:
-#                 if pretoken in bp_to_pretokens[bp]:
-#                     bp_to_pretokens[bp].remove(pretoken)
-#             for bp in to_add:
-#                 bp_to_pretokens[bp].add(pretoken)
-
-#             # for bp in old_bps:
-#             #     if pretoken in bp_to_pretokens[bp]:
-#             #         bp_to_pretokens[bp].remove(pretoken)
-#             #     bp_to_count[bp] -= cnt
-
-#             # for bp in new_bps:
-#             #     bp_to_pretokens[bp].add(pretoken)
-#             #     bp_to_count[bp] += cnt
-
-#     t3 = time.perf_counter()
-#     print(f"vocab size: {len(vocab)}, merges size: {len(merges)}")
-#     print(f"BPE training done. Elapsed: {t3 - t2}s")
-#     return vocab, merges
 
 
 class BPETokenizer:
