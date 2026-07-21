@@ -1,4 +1,5 @@
 import collections
+import heapq
 
 # from typing import BinaryIO, Collection
 import json
@@ -174,6 +175,34 @@ def build_vocab_merges_from_file(
     return build_vocab_merges(pretoken_to_count, vocab_size, special_tokens)
 
 
+class BPHeapNode:
+    __slots__ = ("count", "bp")
+
+    def __init__(self, bp: BytesPair, count: int):
+        self.bp = bp
+        self.count = count
+
+    def __lt__(self, other):
+        if self.count != other.count:
+            return self.count > other.count
+        return self.bp > other.bp
+
+
+class BPHeap:
+    def __init__(self):
+        self.heap: list[BPHeapNode] = []
+
+    def push(self, bp: BytesPair, count: int):
+        heapq.heappush(self.heap, BPHeapNode(bp, count))
+
+    def pop(self, bp_counts: dict[BytesPair, int]) -> BytesPair:
+        while self.heap:
+            node = heapq.heappop(self.heap)
+            if bp_counts.get(node.bp, -1) == node.count:
+                return node.bp
+        return (bytes([0]), bytes([0]))  # should not happen
+
+
 # TODO: optimization
 def build_vocab_merges(
     pretoken_to_count: dict[str, int],
@@ -213,6 +242,11 @@ def build_vocab_merges(
             bp_to_count[bp] += cnt
             bp_to_pretokens[bp].add(pretoken)
 
+    # TODO:
+    bp_heap = BPHeap()
+    for bp, count in bp_to_count.items():
+        bp_heap.push(bp, count)
+
     t3 = time.perf_counter()
     print(f"init bp_to_count and bp_to_pretokens done. elapsed: {t3-t2:.6f}s")
 
@@ -221,20 +255,26 @@ def build_vocab_merges(
     while len(vocab) < vocab_size:
         # get max BP to merge
         t10 = time.perf_counter()
-        bp_to_merge = get_max_bp(bp_to_count)
-        print(f"  round #{len(merges)} merge {bp_to_merge}")
+
+        # TODO: use bp_heap
+        # bp_to_merge = get_max_bp(bp_to_count)
+        bp_to_merge = bp_heap.pop(bp_to_count)
         t11 = time.perf_counter()
+
+        print(f"  round #{len(merges)} merge {bp_to_merge}")
         print(f"  get_max_bp: elapsed {t11-t10:.6f}s")
 
         # update merges and vocab
         merges.append(bp_to_merge)
         vocab[len(vocab)] = bp_to_merge[0] + bp_to_merge[1]
         t12 = time.perf_counter()
-        print(f"  update merges and vocab: elapsed {t12-t11:.6f}s")
+        # print(f"  update merges and vocab: elapsed {t12-t11:.6f}s")
 
         affected_pretokens = bp_to_pretokens[bp_to_merge].copy()
         latencies = collections.defaultdict(float)
-        # TODO: this part toooooo slow
+
+        # collect affected pretokens' updates
+        bps_to_update = set()
         for pretoken in affected_pretokens:
             ta = time.perf_counter()
             cnt = pretoken_counts[pretoken]
@@ -256,21 +296,26 @@ def build_vocab_merges(
             pretoken_to_bt[pretoken] = new_bt
 
             # update bp_to_count
-            for bp in new_bps:
-                bp_to_count[bp] += cnt
-            for bp in old_bps:
-                bp_to_count[bp] -= cnt
+            old_counts = collections.Counter(old_bps)
+            new_counts = collections.Counter(new_bps)
+
+            remove_bps = old_counts - new_counts
+            add_bps = new_counts - old_counts
+            for bp, diff in add_bps.items():
+                bps_to_update.add(bp)
+                bp_to_count[bp] += diff * cnt
+                # bp_heap.push(bp, bp_to_count[bp])  # TODO
+            for bp, diff in remove_bps.items():
+                bps_to_update.add(bp)
+                bp_to_count[bp] -= diff * cnt
+
                 if bp_to_count[bp] <= 0:
                     bp_to_count.pop(bp)
 
             # update bp_to_pretokens
             te = time.perf_counter()
             latencies["bp_to_count"] += te - td
-            # print(f"  update bp_to_count: elapsed {te-tb:.6f}s")
 
-            # print(f"  update bp_to_pretokens: elapsed {te-tb:.6f}s")
-            # print(f"  update bp_to_pretokens: elapsed {te-tb:.6f}s")
-            #
             old_bps_set = set(old_bps)
             new_bps_set = set(new_bps)
             to_remove = old_bps_set - new_bps_set
@@ -281,18 +326,23 @@ def build_vocab_merges(
             for bp in to_add:
                 bp_to_pretokens[bp].add(pretoken)
 
-            te = time.perf_counter()
-            latencies["bp_to_pretokens"] += te - td
+            tf = time.perf_counter()
+            latencies["bp_to_pretokens"] += tf - te
+
+        # TODO: update bp_heap
+        for bp in bps_to_update:
+            if bp in bp_to_count:
+                bp_heap.push(bp, bp_to_count[bp])
 
         t13 = time.perf_counter()
         # print(f"  round takes  {len(affected_pretokens)} elapsed {t13-t10:.6f}s")
         print(
-            f"  update affected_pretokens {len(affected_pretokens)} elapsed {t13-t12:.6f}s, latencies: {latencies}"
+            f"  update affected_pretokens {len(affected_pretokens)}, elapsed {t13-t12:.6f}s, latencies: {latencies}"
         )
 
     t4 = time.perf_counter()
 
-    print(f"all done . Elapsed: {t4 - t3}s")
+    print(f"all done. elapsed: {t4 - t3}s")
     print(f"vocab size: {len(vocab)}, merges size: {len(merges)}")
     return vocab, merges
 
