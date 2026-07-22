@@ -6,6 +6,9 @@ from jaxtyping import Bool, Float, Int
 from torch import Tensor
 
 
+# TODO: replace 2-D weights with Linear. This might need fix load_state_dict. Not urgent now
+
+
 def init_linear_weights(
     in_dim: int,
     out_dim: int,
@@ -154,7 +157,7 @@ class RotaryPositionalEmbedding(torch.nn.Module):
         return rearrange(x_rotated, "v ... d -> ... (d v)")
 
     def forward(self, x: torch.Tensor, token_positions: torch.Tensor) -> torch.Tensor:
-        # TODO: with multi-head attention, broadcast might be wrong.
+        # NOTE: MHA should handle token_positions shape. Not RoPE's responsibility
         # # 1. extend cache
         max_pos = torch.max(token_positions).item()
         if max_pos >= self.max_seq_len:
@@ -192,6 +195,75 @@ def scaled_dot_product_attention(
     attn = softmax(scores, dim=-1)
 
     return attn @ V
+
+
+class MultiheadSelfAttention(torch.nn.Module):
+    def __init__(
+        self,
+        d_model: int,
+        num_heads: int,
+        max_seq_len: int,
+        theta: int | None = None,  # RoPE
+        device: torch.device | None = None,
+        dtype: torch.dtype | None = None,
+    ):
+        super().__init__()
+        self.d_model = d_model
+        self.num_heads = num_heads
+        d_k = d_model // num_heads
+
+        self.W_q = torch.nn.Parameter(
+            init_linear_weights(d_model, d_model, device, dtype)
+        )
+        self.W_k = torch.nn.Parameter(
+            init_linear_weights(d_model, d_model, device, dtype)
+        )
+        self.W_v = torch.nn.Parameter(
+            init_linear_weights(d_model, d_model, device, dtype)
+        )
+        self.W_o = torch.nn.Parameter(
+            init_linear_weights(d_model, d_model, device, dtype)
+        )
+        causal_mask = torch.tril(
+            torch.ones(max_seq_len, max_seq_len, dtype=torch.bool, device=device)
+        )
+        self.register_buffer("causal_mask", causal_mask, persistent=False)
+
+        self.rope = (
+            RotaryPositionalEmbedding(theta, d_k, max_seq_len, device)
+            if theta is not None
+            else None
+        )
+
+    def forward(
+        self,
+        x: Float[Tensor, " ... seq_len d_model"],
+        token_positions: Int[Tensor, " ... sequence_length"] | None = None,
+    ) -> torch.Tensor:
+        seq_len = x.shape[-2]
+
+        q = x @ self.W_q.T
+        k = x @ self.W_k.T
+        v = x @ self.W_v.T
+
+        # slice
+        qh = rearrange(q, "... s (h d) -> ... h s d", h=self.num_heads)
+        kh = rearrange(k, "... s (h d) -> ... h s d", h=self.num_heads)
+        vh = rearrange(v, "... s (h d) -> ... h s d", h=self.num_heads)
+
+        if self.rope is not None:
+            if token_positions is None:
+                token_positions = torch.arange(seq_len, device=x.device)
+            token_positions = rearrange(token_positions, "... seq -> ... 1 seq")
+            qh = self.rope(qh, token_positions)
+            kh = self.rope(kh, token_positions)
+
+        mask = self.causal_mask[:seq_len, :seq_len]
+
+        attn = scaled_dot_product_attention(qh, kh, vh, mask)
+        attn = rearrange(attn, "... h s d -> ... s (h d)")
+
+        return attn @ self.W_o.T
 
 
 # class ModernRotaryPositionalEmbedding(torch.nn.Module):
