@@ -2,6 +2,8 @@ import math
 
 import torch
 from einops import einsum, rearrange, repeat
+from jaxtyping import Bool, Float, Int
+from torch import Tensor
 
 
 def init_linear_weights(
@@ -171,6 +173,25 @@ def softmax(x: torch.Tensor, dim: int) -> torch.Tensor:
     normalized = x - torch.amax(x, dim=dim, keepdim=True)
     exp = torch.exp(normalized)
     return exp / torch.sum(exp, dim=dim, keepdim=True)
+
+
+def scaled_dot_product_attention(
+    Q: Float[Tensor, " ... queries d_k"],
+    K: Float[Tensor, " ... keys d_k"],
+    V: Float[Tensor, " ... keys d_v"],
+    mask: Bool[Tensor, " ... queries keys"] | None = None,
+) -> torch.Tensor:
+    d_k = Q.shape[-1]
+
+    scores = einsum(
+        Q, K, "... queries dk, ... keys dk -> ... queries keys"
+    ) / math.sqrt(d_k)
+    if mask is not None:
+        attn_mask = torch.where(mask, 0.0, float("-inf"))
+        scores = scores + attn_mask
+    attn = softmax(scores, dim=-1)
+
+    return attn @ V
 
 
 # class ModernRotaryPositionalEmbedding(torch.nn.Module):
