@@ -9,6 +9,7 @@ import multiprocessing
 import os
 import pickle
 import time
+from typing import Iterable, Iterator
 
 import regex as re
 
@@ -73,9 +74,13 @@ def get_chunk_boundaries(
 
 
 def pretokenize_str(s: str, special_tokens: list[str]) -> dict[str, int]:
-    pattern = "|".join([re.escape(token) for token in special_tokens])
+    if special_tokens:
+        pattern = "|".join([re.escape(token) for token in special_tokens])
+        parts = re.split(pattern, s)  # use str.split() if memory bomb
+    else:
+        parts = [s]
+
     counts = collections.Counter()
-    parts = re.split(pattern, s)  # use str.split() if memory bomb
     for part in parts:
         for m in re.finditer(PRETOKENIZE_PAT, part):
             counts[m.group()] += 1
@@ -128,7 +133,6 @@ BytesPair = tuple[bytes, bytes]
 
 
 def str_to_bt(s: str) -> BytesTuple:
-    # return tuple(bytes([b]) for b in s.encode("utf-8"))  # slower?
     b = s.encode("utf-8")
     return tuple(b[i : i + 1] for i in range(len(b)))
 
@@ -186,17 +190,13 @@ def build_bp_index(
     return bp_to_count, bp_to_pretokens
 
 
-# TODO: Level 2 optimize
 def merge_bp(bt: BytesTuple, bp: BytesPair):
     M = bp[0] + bp[1]
-
     res: list[bytes] = []
-
     delta: dict[BytesPair, int] = collections.defaultdict(int)
 
     n = len(bt)
     i = 0
-
     while i < n:
         if i < n - 1 and bt[i] == bp[0] and bt[i + 1] == bp[1]:
             delta[bp] -= 1
@@ -368,7 +368,7 @@ def train_bpe(
         pretoken_to_count = parallel_pretokenize(input_path, NPROC, special_tokens)
     with Timer("build_vocab_merges"):
         vocab, merges = build_vocab_merges(
-            pretoken_to_count, vocab_size, special_tokens
+            pretoken_to_count, vocab_size, special_tokens, False
         )
     return vocab, merges
 
@@ -382,8 +382,19 @@ class BPETokenizer:
     ):
         self.vocab = vocab
         self.merges = merges
-        self.special_tokens = special_tokens
-        self.index: dict[bytes, int] = {v: k for k, v in self.vocab.items()}
+        if special_tokens:
+            self.special_tokens = sorted(special_tokens, key=len, reverse=True)
+            self.special_tokens_pattern = (
+                "("
+                + "|".join([f"{re.escape(token)}" for token in self.special_tokens])
+                + ")"
+            )
+        else:
+            self.special_tokens = []
+            self.special_tokens_pattern = None
+        # print(self.special_tokens_pattern)
+        self.bytes_index: dict[bytes, int] = {v: k for k, v in self.vocab.items()}
+        self.merge_rank = {m: rank for rank, m in enumerate(self.merges)}
 
     @classmethod
     def from_files(
@@ -392,16 +403,57 @@ class BPETokenizer:
         merges_filepath: str,
         special_tokens: list[str] | None = None,
     ):
-        vocab = json.load(open(vocab_filepath, "r"))
-        merges = json.load(open(merges_filepath, "r"))
+        vocab = pickle.load(open(vocab_filepath, "rb"))
+        merges = pickle.load(open(merges_filepath, "rb"))
         return cls(vocab, merges, special_tokens)
 
     def encode(self, text: str) -> list[int]:
-        # 1. split
-        raise NotImplementedError("")
+        res = []
+        if self.special_tokens_pattern:
+            parts = re.split(self.special_tokens_pattern, text)
+        else:
+            parts = [text]
+
+        for part in parts:
+            if part in self.special_tokens:
+                res.append(self.bytes_index[part.encode("utf-8")])
+            else:
+                for m in re.finditer(PRETOKENIZE_PAT, part):
+                    res.extend(self.encode_pretoken(m.group()))
+        return res
+
+    def encode_pretoken(self, pretoken: str) -> list[int]:
+        """pretoken should never be a special token"""
+        assert pretoken not in self.special_tokens
+
+        bt = str_to_bt(pretoken)
+        done = False
+
+        BIG = len(self.merges) + 10000  # much larger than |vocab|
+
+        while len(bt) >= 2 and not done:
+            done = True
+            bp_to_merge = None
+            merge_rank = BIG  # very big
+
+            for bp in set(itertools.pairwise(bt)):
+                if (rank := self.merge_rank.get(bp, BIG)) < merge_rank:
+                    done = False
+                    merge_rank = rank
+                    bp_to_merge = bp
+
+            if bp_to_merge:
+                bt, _, _ = merge_bp(bt, bp_to_merge)
+
+        return [self.bytes_index[b] for b in bt]
+
+    def encode_iterable(self, iterable: Iterable[str]) -> Iterator[int]:
+        for text in iterable:
+            yield from self.encode(text)
 
     def decode(self, ids: list[int]) -> str:
-        raise NotImplementedError("")
+        b = b"".join(self.vocab[id] for id in ids)
+        return b.decode("utf-8", errors="replace")
 
 
 # TESTING
@@ -416,3 +468,6 @@ class BPETokenizer:
 
 # build_vocab_merges({"ababab":4}, 259, [], use_cache=False)
 # # C → [(b'a',b'b'), (b'ab',b'ab'), (b'abab',b'ab')]
+
+
+# tokenizer = BPETokenizer.from_files("/data/users/wilsonhong/projects/stanford-cs336/assignment1-basics/tmp/owt_vocab.pickle", "/data/users/wilsonhong/projects/stanford-cs336/assignment1-basics/tmp/owt_merges.pickle", ["<|endoftext|>"])
