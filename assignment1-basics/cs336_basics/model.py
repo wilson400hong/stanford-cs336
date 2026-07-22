@@ -63,13 +63,13 @@ class RMSNorm(torch.nn.Module):
     ):
         super().__init__()
         self.eps = eps
-        self.G = torch.nn.Parameter(
+        self.weight = torch.nn.Parameter(
             torch.ones(d_model, dtype=dtype, device=device), requires_grad=True
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         in_dtype = x.dtype
         x = x.to(torch.float32)
-        denom = torch.sqrt(torch.mean(torch.pow(x, 2), dim=-1, keepdim=True) + self.eps)
-        res = (x * self.G) / denom
-        return res.to(in_dtype)
+        variance = torch.mean(torch.pow(x, 2), dim=-1, keepdim=True)
+        x_normed = x * torch.rsqrt(variance + self.eps)
+        return x_normed.to(in_dtype) * self.weight
