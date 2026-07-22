@@ -7,6 +7,7 @@ from typing import Any, BinaryIO, IO
 import numpy.typing as npt
 import torch
 from cs336_basics.bpe import BPETokenizer, train_bpe
+from cs336_basics.model import Embedding, Linear
 from jaxtyping import Bool, Float, Int
 from torch import Tensor
 
@@ -30,7 +31,10 @@ def run_linear(
         Float[Tensor, "... d_out"]: The transformed output of your linear module.
     """
 
-    raise NotImplementedError
+    linear = Linear(d_in, d_out, device=weights.device, dtype=weights.dtype)
+    linear.load_state_dict({"W": weights})
+
+    return linear.forward(in_features)
 
 
 def run_embedding(
@@ -52,7 +56,11 @@ def run_embedding(
         Float[Tensor, "... d_model"]: Batch of embeddings returned by your Embedding layer.
     """
 
-    raise NotImplementedError
+    embedding = Embedding(
+        vocab_size, d_model, device=weights.device, dtype=weights.dtype
+    )
+    embedding.load_state_dict({"embeddings": weights})
+    return embedding.forward(token_ids)
 
 
 def run_swiglu(
