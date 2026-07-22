@@ -167,6 +167,12 @@ class RotaryPositionalEmbedding(torch.nn.Module):
         return (x * cos) + (self.rotate_every_two(x) * sin)
 
 
+def softmax(x: torch.Tensor, dim: int) -> torch.Tensor:
+    normalized = x - torch.amax(x, dim=dim, keepdim=True)
+    exp = torch.exp(normalized)
+    return exp / torch.sum(exp, dim=dim, keepdim=True)
+
+
 # class ModernRotaryPositionalEmbedding(torch.nn.Module):
 #     """
 #     Half - Half rotation
