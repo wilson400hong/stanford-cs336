@@ -15,11 +15,11 @@ from cs336_basics.model import (
     RotaryPositionalEmbedding,
     scaled_dot_product_attention,
     SiLU,
-    softmax,
     SwiGLU,
     TransformerBlock,
     TransformerLM,
 )
+from cs336_basics.nn_utils import softmax
 from jaxtyping import Bool, Float, Int
 from torch import Tensor
 

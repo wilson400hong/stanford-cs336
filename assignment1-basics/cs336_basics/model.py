@@ -5,6 +5,7 @@ from einops import einsum, rearrange, repeat
 from jaxtyping import Bool, Float, Int
 from torch import Tensor
 
+from .nn_utils import softmax
 
 # TODO: replace 2-D weights with Linear. This might need fix load_state_dict. Not urgent now
 
@@ -177,12 +178,6 @@ class RotaryPositionalEmbedding(torch.nn.Module):
         sin = self.sin_cached[token_positions]
         # apply RoPE
         return (x * cos) + (self.rotate_every_two(x) * sin)
-
-
-def softmax(x: torch.Tensor, dim: int) -> torch.Tensor:
-    normalized = x - torch.amax(x, dim=dim, keepdim=True)
-    exp = torch.exp(normalized)
-    return exp / torch.sum(exp, dim=dim, keepdim=True)
 
 
 def scaled_dot_product_attention(
