@@ -19,7 +19,7 @@ from cs336_basics.model import (
     TransformerBlock,
     TransformerLM,
 )
-from cs336_basics.nn_utils import cross_entropy, softmax
+from cs336_basics.nn_utils import cross_entropy, gradient_clipping, softmax
 from cs336_basics.optimizer import AdamW, lr_cosine_schedule
 from jaxtyping import Bool, Float, Int
 from torch import Tensor
@@ -520,7 +520,7 @@ def run_gradient_clipping(
 
     The gradients of the parameters (parameter.grad) should be modified in-place.
     """
-    raise NotImplementedError
+    return gradient_clipping(parameters, max_l2_norm)
 
 
 def get_adamw_cls() -> Any:

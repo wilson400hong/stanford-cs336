@@ -1,3 +1,5 @@
+from typing import Iterable
+
 import torch
 
 
@@ -22,3 +24,15 @@ def cross_entropy(logits, targets):
 
     ce = -target_log_prob.mean()
     return ce
+
+
+@torch.no_grad
+def gradient_clipping(
+    params: Iterable[torch.Tensor], max_norm: float, eps: float = 1e-6
+):
+    params = [p for p in params if p.grad is not None]  # materialize
+    total_norm = sum((p.grad**2).sum() for p in params).sqrt()
+    if total_norm <= max_norm:
+        return
+    for p in params:
+        p.grad.mul_(max_norm / (total_norm + eps))
