@@ -19,7 +19,7 @@ from cs336_basics.model import (
     TransformerBlock,
     TransformerLM,
 )
-from cs336_basics.nn_utils import softmax
+from cs336_basics.nn_utils import cross_entropy, softmax
 from jaxtyping import Bool, Float, Int
 from torch import Tensor
 
@@ -505,7 +505,7 @@ def run_cross_entropy(
     Returns:
         Float[Tensor, ""]: The average cross-entropy loss across examples.
     """
-    raise NotImplementedError
+    return cross_entropy(inputs, targets)
 
 
 def run_gradient_clipping(
