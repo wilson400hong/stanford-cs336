@@ -20,6 +20,7 @@ from cs336_basics.model import (
     TransformerLM,
 )
 from cs336_basics.nn_utils import cross_entropy, softmax
+from cs336_basics.optimizer import AdamW
 from jaxtyping import Bool, Float, Int
 from torch import Tensor
 
@@ -526,7 +527,7 @@ def get_adamw_cls() -> Any:
     """
     Returns a torch.optim.Optimizer that implements AdamW.
     """
-    raise NotImplementedError
+    return AdamW
 
 
 def run_get_lr_cosine_schedule(

@@ -14,7 +14,7 @@ def cross_entropy(logits, targets):
     log_sum_exp = torch.log(torch.sum(torch.exp(shifted_logits), dim=-1, keepdim=True))
     log_probs = shifted_logits - log_sum_exp
 
-    # (2, 4) -> (2, 4, 1)
+    # (2, 4) -> (2, 4, 1), gather requires same number of dimensions
     target_idx = targets.unsqueeze(-1)
     target_log_prob = torch.gather(dim=-1, index=target_idx, input=log_probs).squeeze(
         -1
