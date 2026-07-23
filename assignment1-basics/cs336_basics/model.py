@@ -221,7 +221,7 @@ class MultiheadSelfAttention(torch.nn.Module):
         self.q_proj = Linear(d_model, d_model, device, dtype)
         self.k_proj = Linear(d_model, d_model, device, dtype)
         self.v_proj = Linear(d_model, d_model, device, dtype)
-        self.o_proj = Linear(d_model, d_model, device, dtype)
+        self.output_proj = Linear(d_model, d_model, device, dtype)
 
         causal_mask = torch.tril(
             torch.ones(max_seq_len, max_seq_len, dtype=torch.bool, device=device)
@@ -264,7 +264,37 @@ class MultiheadSelfAttention(torch.nn.Module):
         attn = scaled_dot_product_attention(qh, kh, vh, mask)
         attn = rearrange(attn, "... h s d -> ... s (h d)")
 
-        return self.o_proj(attn)
+        return self.output_proj(attn)
+
+
+class TransformerBlock(torch.nn.Module):
+    def __init__(
+        self,
+        d_model: int,
+        num_heads: int,
+        d_ff: int,
+        max_seq_len: int,
+        theta: float,
+        eps: float = 1e-5,
+        device: torch.device | None = None,
+        dtype: torch.dtype | None = None,
+    ):
+        super().__init__()
+        self.ln1 = RMSNorm(d_model, eps, device=device, dtype=dtype)
+        self.ln2 = RMSNorm(d_model, eps, device=device, dtype=dtype)
+        self.ffn = SwiGLU(d_model, d_ff, device, dtype)
+        self.attn = MultiheadSelfAttention(
+            d_model, num_heads, max_seq_len, theta, device, dtype
+        )
+
+    def forward(
+        self,
+        x: Float[Tensor, "batch sequence_length d_model"],
+        token_positions: Int[Tensor, " ... sequence_length"] | None = None,
+    ) -> torch.Tensor:
+        # TODO: token_positions!!
+        y = x + self.attn(self.ln1(x), token_positions)
+        return y + self.ffn(self.ln2(y))
 
 
 # class ModernRotaryPositionalEmbedding(torch.nn.Module):
