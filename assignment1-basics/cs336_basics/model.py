@@ -36,13 +36,21 @@ class Linear(torch.nn.Module):
         dtype: torch.dtype | None = None,
     ):
         super().__init__()
-        self.W = torch.nn.Parameter(
-            init_linear_weights(in_features, out_features, device, dtype)
+        self.weight = torch.nn.Parameter(
+            torch.empty(
+                (out_features, in_features),  # since we use x @ w.T
+                dtype=dtype,
+                device=device,
+            )
         )
+        var = 2 / (in_features + out_features)
+        std = math.sqrt(var)
+        torch.nn.init.trunc_normal_(self.weight, std=std, a=-3 * std, b=3 * std)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return einsum(x, self.W, "... d_in, d_out d_in -> ... d_out")
-        # return x @ self.W.T
+        return einsum(
+            x, self.weight, "... d_in, d_out d_in -> ... d_out"
+        )  # x @ weight.T
 
 
 class Embedding(torch.nn.Module):
@@ -54,17 +62,17 @@ class Embedding(torch.nn.Module):
         dtype: torch.dtype | None = None,
     ):
         super().__init__()
-        self.embeddings = torch.nn.Parameter(
+        self.weight = torch.nn.Parameter(
             torch.empty(
                 (num_embeddings, embedding_dim),
                 dtype=dtype,
                 device=device,
             )
         )
-        torch.nn.init.trunc_normal_(self.embeddings, std=1.0, a=-3.0, b=3.0)
+        torch.nn.init.trunc_normal_(self.weight, std=1.0, a=-3.0, b=3.0)
 
     def forward(self, token_ids: torch.Tensor) -> torch.Tensor:
-        return self.embeddings[token_ids]
+        return self.weight[token_ids]
 
 
 class RMSNorm(torch.nn.Module):
@@ -86,7 +94,12 @@ class RMSNorm(torch.nn.Module):
         x = x.to(torch.float32)
         variance = torch.mean(torch.pow(x, 2), dim=-1, keepdim=True)
         x_normed = x * torch.rsqrt(variance + self.eps)
+        # NOTE: in_dtype may cause mixed precision bad
         return x_normed.to(in_dtype) * self.weight
+
+
+def SiLU(x: torch.Tensor) -> torch.Tensor:
+    return x * torch.sigmoid(x)
 
 
 class SwiGLU(torch.nn.Module):
@@ -98,16 +111,12 @@ class SwiGLU(torch.nn.Module):
         dtype: torch.dtype | None = None,
     ):
         super().__init__()
-        self.W1 = torch.nn.Parameter(init_linear_weights(d_model, d_ff, device, dtype))
-        self.W2 = torch.nn.Parameter(init_linear_weights(d_ff, d_model, device, dtype))
-        self.W3 = torch.nn.Parameter(init_linear_weights(d_model, d_ff, device, dtype))
+        self.w1 = Linear(d_model, d_ff, device, dtype)
+        self.w2 = Linear(d_ff, d_model, device, dtype)
+        self.w3 = Linear(d_model, d_ff, device, dtype)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        a = x @ self.W1.T
-        silu = a * torch.sigmoid(a)
-        b = x @ self.W3.T
-        c = silu * b
-        return c @ self.W2.T
+        return self.w2(SiLU(self.w1(x)) * self.w3(x))
 
 
 class RotaryPositionalEmbedding(torch.nn.Module):
@@ -130,7 +139,6 @@ class RotaryPositionalEmbedding(torch.nn.Module):
             theta ** (torch.arange(0, d_k, 2, dtype=torch.float32, device=device) / d_k)
         )
         self.register_buffer("inv_freq", inv_freq, persistent=False)
-
         self._init_cache(max_seq_len, device)
 
     def _init_cache(self, max_seq_len: int, device: torch.device):
@@ -138,8 +146,9 @@ class RotaryPositionalEmbedding(torch.nn.Module):
         t = torch.arange(max_seq_len, dtype=torch.float32, device=device)
 
         # (max_seq_len, d_k/2)
-        freqs = torch.outer(t, self.inv_freq)
-        # freqs = torch.einsum("i, j -> i j", t, self.inv_freq)
+        freqs = torch.outer(
+            t, self.inv_freq
+        )  # freqs = torch.einsum("i, j -> i j", t, self.inv_freq)
 
         # [00, 01] -> [θ0, θ0, θ1, θ1]
         # (max_seq_len, d_k)
@@ -158,17 +167,15 @@ class RotaryPositionalEmbedding(torch.nn.Module):
 
     def forward(self, x: torch.Tensor, token_positions: torch.Tensor) -> torch.Tensor:
         # NOTE: MHA should handle token_positions shape. Not RoPE's responsibility
-        # # 1. extend cache
-        max_pos = torch.max(token_positions).item()
-        if max_pos >= self.max_seq_len:
-            print("[INFO] Extending RoPE cache to", max_pos + 128)
-            self._init_cache(max_pos + 128, device=x.device)
+        # NOTE: max(token_positions) should < max_pos
+        # max_pos = torch.max(token_positions).item()
+        # if max_pos >= self.max_seq_len:
+        #     self._init_cache(max_pos + 128, device=x.device)
 
-        # 2. advance index and unsqueeze to broadcast
+        # advance index and unsqueeze to broadcast
         cos = self.cos_cached[token_positions]
         sin = self.sin_cached[token_positions]
-
-        # 3. apply RoPE
+        # apply RoPE
         return (x * cos) + (self.rotate_every_two(x) * sin)
 
 
@@ -192,9 +199,8 @@ def scaled_dot_product_attention(
     if mask is not None:
         attn_mask = torch.where(mask, 0.0, float("-inf"))
         scores = scores + attn_mask
-    attn = softmax(scores, dim=-1)
-
-    return attn @ V
+    scores = softmax(scores, dim=-1)
+    return scores @ V
 
 
 class MultiheadSelfAttention(torch.nn.Module):
@@ -203,7 +209,7 @@ class MultiheadSelfAttention(torch.nn.Module):
         d_model: int,
         num_heads: int,
         max_seq_len: int,
-        theta: int | None = None,  # RoPE
+        theta: float | None = None,  # RoPE
         device: torch.device | None = None,
         dtype: torch.dtype | None = None,
     ):
@@ -212,18 +218,11 @@ class MultiheadSelfAttention(torch.nn.Module):
         self.num_heads = num_heads
         d_k = d_model // num_heads
 
-        self.W_q = torch.nn.Parameter(
-            init_linear_weights(d_model, d_model, device, dtype)
-        )
-        self.W_k = torch.nn.Parameter(
-            init_linear_weights(d_model, d_model, device, dtype)
-        )
-        self.W_v = torch.nn.Parameter(
-            init_linear_weights(d_model, d_model, device, dtype)
-        )
-        self.W_o = torch.nn.Parameter(
-            init_linear_weights(d_model, d_model, device, dtype)
-        )
+        self.q_proj = Linear(d_model, d_model, device, dtype)
+        self.k_proj = Linear(d_model, d_model, device, dtype)
+        self.v_proj = Linear(d_model, d_model, device, dtype)
+        self.o_proj = Linear(d_model, d_model, device, dtype)
+
         causal_mask = torch.tril(
             torch.ones(max_seq_len, max_seq_len, dtype=torch.bool, device=device)
         )
@@ -242,15 +241,17 @@ class MultiheadSelfAttention(torch.nn.Module):
     ) -> torch.Tensor:
         seq_len = x.shape[-2]
 
-        q = x @ self.W_q.T
-        k = x @ self.W_k.T
-        v = x @ self.W_v.T
+        # q, k, v
+        q = self.q_proj(x)
+        k = self.k_proj(x)
+        v = self.v_proj(x)
 
         # slice
         qh = rearrange(q, "... s (h d) -> ... h s d", h=self.num_heads)
         kh = rearrange(k, "... s (h d) -> ... h s d", h=self.num_heads)
         vh = rearrange(v, "... s (h d) -> ... h s d", h=self.num_heads)
 
+        # RoPE
         if self.rope is not None:
             if token_positions is None:
                 token_positions = torch.arange(seq_len, device=x.device)
@@ -263,7 +264,7 @@ class MultiheadSelfAttention(torch.nn.Module):
         attn = scaled_dot_product_attention(qh, kh, vh, mask)
         attn = rearrange(attn, "... h s d -> ... s (h d)")
 
-        return attn @ self.W_o.T
+        return self.o_proj(attn)
 
 
 # class ModernRotaryPositionalEmbedding(torch.nn.Module):

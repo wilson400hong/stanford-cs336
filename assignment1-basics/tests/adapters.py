@@ -14,6 +14,7 @@ from cs336_basics.model import (
     RMSNorm,
     RotaryPositionalEmbedding,
     scaled_dot_product_attention,
+    SiLU,
     softmax,
     SwiGLU,
 )
@@ -41,7 +42,7 @@ def run_linear(
     """
 
     linear = Linear(d_in, d_out, device=weights.device, dtype=weights.dtype)
-    linear.load_state_dict({"W": weights})
+    linear.load_state_dict({"weight": weights})
 
     return linear.forward(in_features)
 
@@ -68,7 +69,7 @@ def run_embedding(
     embedding = Embedding(
         vocab_size, d_model, device=weights.device, dtype=weights.dtype
     )
-    embedding.load_state_dict({"embeddings": weights})
+    embedding.load_state_dict({"weight": weights})
     return embedding.forward(token_ids)
 
 
@@ -103,7 +104,9 @@ def run_swiglu(
     # swiglu.w3.weight.data = w3_weight
 
     swiglu = SwiGLU(d_model, d_ff, device=w1_weight.device, dtype=w1_weight.dtype)
-    swiglu.load_state_dict({"W1": w1_weight, "W2": w2_weight, "W3": w3_weight})
+    swiglu.load_state_dict(
+        {"w1.weight": w1_weight, "w2.weight": w2_weight, "w3.weight": w3_weight}
+    )
 
     return swiglu.forward(in_features)
 
@@ -164,10 +167,10 @@ def run_multihead_self_attention(
     mha = MultiheadSelfAttention(d_model, num_heads, in_features.shape[-2])
     mha.load_state_dict(
         {
-            "W_q": q_proj_weight,
-            "W_k": k_proj_weight,
-            "W_v": v_proj_weight,
-            "W_o": o_proj_weight,
+            "q_proj.weight": q_proj_weight,
+            "k_proj.weight": k_proj_weight,
+            "v_proj.weight": v_proj_weight,
+            "o_proj.weight": o_proj_weight,
         }
     )
     return mha.forward(in_features)
@@ -213,10 +216,10 @@ def run_multihead_self_attention_with_rope(
     mha = MultiheadSelfAttention(d_model, num_heads, max_seq_len, theta)
     mha.load_state_dict(
         {
-            "W_q": q_proj_weight,
-            "W_k": k_proj_weight,
-            "W_v": v_proj_weight,
-            "W_o": o_proj_weight,
+            "q_proj.weight": q_proj_weight,
+            "k_proj.weight": k_proj_weight,
+            "v_proj.weight": v_proj_weight,
+            "o_proj.weight": o_proj_weight,
         }
     )
     return mha.forward(in_features, token_positions)
@@ -436,7 +439,7 @@ def run_silu(in_features: Float[Tensor, " ..."]) -> Float[Tensor, " ..."]:
         Float[Tensor,"..."]: of with the same shape as `in_features` with the output of applying
         SiLU to each element.
     """
-    raise NotImplementedError
+    return SiLU(in_features)
 
 
 def run_get_batch(
