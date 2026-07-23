@@ -18,6 +18,7 @@ from cs336_basics.model import (
     softmax,
     SwiGLU,
     TransformerBlock,
+    TransformerLM,
 )
 from jaxtyping import Bool, Float, Int
 from torch import Tensor
@@ -404,7 +405,11 @@ def run_transformer_lm(
         Float[Tensor, "batch_size sequence_length vocab_size"]: Tensor with the predicted unnormalized
         next-word distribution for each token.
     """
-    raise NotImplementedError
+    llm = TransformerLM(
+        vocab_size, context_length, d_model, num_layers, num_heads, d_ff, rope_theta
+    )
+    llm.load_state_dict(weights)
+    return llm(in_indices)
 
 
 def run_rmsnorm(
