@@ -20,7 +20,7 @@ from cs336_basics.model import (
     TransformerLM,
 )
 from cs336_basics.nn_utils import cross_entropy, softmax
-from cs336_basics.optimizer import AdamW
+from cs336_basics.optimizer import AdamW, lr_cosine_schedule
 from jaxtyping import Bool, Float, Int
 from torch import Tensor
 
@@ -555,7 +555,9 @@ def run_get_lr_cosine_schedule(
     Returns:
         Learning rate at the given iteration under the specified schedule.
     """
-    raise NotImplementedError
+    return lr_cosine_schedule(
+        max_learning_rate, min_learning_rate, warmup_iters, cosine_cycle_iters, it
+    )
 
 
 def run_save_checkpoint(
