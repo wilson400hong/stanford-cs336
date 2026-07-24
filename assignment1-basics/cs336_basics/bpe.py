@@ -4,16 +4,17 @@ import itertools
 
 # from typing import BinaryIO, Collection
 import json
-import math
 import multiprocessing
 import os
 import pickle
+import shutil
 import time
 from typing import Iterable, Iterator
 
+import numpy as np
 import regex as re
+from torch.nn.utils._expanded_weights.conv_utils import THRESHOLD
 
-from .bp_index_builder import BPIndexBuilder, parallel_build_bp_index
 from .common import Timer
 
 SPLIT_TOKEN = "<|endoftext|>"
@@ -226,7 +227,6 @@ def build_vocab_merges(
     pretoken_to_count: dict[str, int],
     vocab_size: int,
     special_tokens: list[str],
-    use_cache: bool,  # TODO
 ) -> tuple[dict[int, bytes], list[BytesPair]]:
     # initialize vocab
     vocab: dict[int, bytes] = {}
@@ -241,27 +241,11 @@ def build_vocab_merges(
         with multiprocessing.Pool(NPROC) as pool:
             pretoken_to_bt = pool.map(str_to_bt, pretokens, chunksize=10000)
 
-    TMP_BP_CNT_FILE = "/data/users/wilsonhong/projects/stanford-cs336/assignment1-basics/tmp/bp_to_count.json"
-    TMP_BP_PT_FILE = "/data/users/wilsonhong/projects/stanford-cs336/assignment1-basics/tmp/bp_to_pretokens.json"
-
-    if use_cache:
-        with open(TMP_BP_CNT_FILE, "rb") as f:
-            bp_to_count = pickle.load(f)
-        with open(TMP_BP_PT_FILE, "rb") as f:
-            bp_to_pretokens = pickle.load(f)
-
-    else:
-        with Timer("build_bp_index"):
-            bp_to_count, bp_to_pretokens = build_bp_index(
-                pretoken_counts,
-                pretoken_to_bt,
-            )
-
-        # TODO:
-        # with open(TMP_BP_CNT_FILE, "wb") as f:
-        #     pickle.dump(bp_to_count, f)
-        # with open(TMP_BP_PT_FILE, "wb") as f:
-        #     pickle.dump(bp_to_pretokens, f)
+    with Timer("build_bp_index"):
+        bp_to_count, bp_to_pretokens = build_bp_index(
+            pretoken_counts,
+            pretoken_to_bt,
+        )
 
     with Timer("init bp_heap"):
         bp_heap = BPHeap()
@@ -350,12 +334,11 @@ def build_vocab_merges_from_file(
     file_path: str,
     vocab_size: int,
     special_tokens: list[str],
-    use_cache: bool,
 ) -> tuple[dict[int, bytes], list[BytesPair]]:
     with Timer("load pretoken_to_count from file"):
         with open(file_path, "r") as f:
             pretoken_to_count = json.load(f)
-    return build_vocab_merges(pretoken_to_count, vocab_size, special_tokens, use_cache)
+    return build_vocab_merges(pretoken_to_count, vocab_size, special_tokens)
 
 
 def train_bpe(
@@ -368,7 +351,7 @@ def train_bpe(
         pretoken_to_count = parallel_pretokenize(input_path, NPROC, special_tokens)
     with Timer("build_vocab_merges"):
         vocab, merges = build_vocab_merges(
-            pretoken_to_count, vocab_size, special_tokens, False
+            pretoken_to_count, vocab_size, special_tokens
         )
     return vocab, merges
 
@@ -395,6 +378,7 @@ class BPETokenizer:
         # print(self.special_tokens_pattern)
         self.bytes_index: dict[bytes, int] = {v: k for k, v in self.vocab.items()}
         self.merge_rank = {m: rank for rank, m in enumerate(self.merges)}
+        self.pretoken_cache: dict[str, list[int]] = {}
 
     @classmethod
     def from_files(
@@ -407,6 +391,7 @@ class BPETokenizer:
         merges = pickle.load(open(merges_filepath, "rb"))
         return cls(vocab, merges, special_tokens)
 
+    # TODO: need ot optimize. too slow
     def encode(self, text: str) -> list[int]:
         res = []
         if self.special_tokens_pattern:
@@ -415,17 +400,20 @@ class BPETokenizer:
             parts = [text]
 
         for part in parts:
-            if part in self.special_tokens:
+            if part in self.special_tokens:  # TODO: this might can be faster
                 res.append(self.bytes_index[part.encode("utf-8")])
             else:
                 for m in re.finditer(PRETOKENIZE_PAT, part):
-                    res.extend(self.encode_pretoken(m.group()))
+                    w = m.group()
+                    if w in self.pretoken_cache:
+                        res.extend(self.pretoken_cache[w])
+                    else:
+                        res.extend(self.encode_pretoken(w))
         return res
 
     def encode_pretoken(self, pretoken: str) -> list[int]:
         """pretoken should never be a special token"""
-        assert pretoken not in self.special_tokens
-
+        # assert pretoken not in self.special_tokens
         bt = str_to_bt(pretoken)
         done = False
 
@@ -436,7 +424,7 @@ class BPETokenizer:
             bp_to_merge = None
             merge_rank = BIG  # very big
 
-            for bp in set(itertools.pairwise(bt)):
+            for bp in itertools.pairwise(bt):
                 if (rank := self.merge_rank.get(bp, BIG)) < merge_rank:
                     done = False
                     merge_rank = rank
@@ -445,15 +433,134 @@ class BPETokenizer:
             if bp_to_merge:
                 bt, _, _ = merge_bp(bt, bp_to_merge)
 
-        return [self.bytes_index[b] for b in bt]
+        tokens = [self.bytes_index[b] for b in bt]
+        self.pretoken_cache[pretoken] = tokens
+        return tokens
 
     def encode_iterable(self, iterable: Iterable[str]) -> Iterator[int]:
-        for text in iterable:
-            yield from self.encode(text)
+        THRESHOLD = 1e5
+        batch = []
+        size = 0
+        has_split_token = False
+        for line in iterable:
+            batch.append(line)
+            has_split_token |= SPLIT_TOKEN in line
+            size += len(line)
+            if size > THRESHOLD and has_split_token:
+                text = "".join(batch)
+                pos = text.rfind(SPLIT_TOKEN)
+                pos += len(SPLIT_TOKEN)
+                to_encode = text[:pos]
+                remain = text[pos:]
+                has_split_token = SPLIT_TOKEN in remain
+                batch = [remain]
+                size = len(remain)
+
+                yield from self.encode(to_encode)
+        if batch:
+            yield from self.encode("".join(batch))
+
+    def encode_file(self, in_file: str, out_file: str, num_processes: int = 1):
+        # write as np array binary format, uint16
+        buffer = []
+        BUFFER_MAX = 1e6
+        total = 0
+        t0 = time.perf_counter()
+        with open(in_file, "r") as f, open(out_file, "wb") as g:
+            for token in self.encode_iterable(f):
+                # assert token < 2**16, "token id > uint16"
+                buffer.append(token)
+                if len(buffer) >= BUFFER_MAX:
+                    total += len(buffer)
+                    elapsed = time.perf_counter() - t0
+                    print(f"elapsed: {elapsed}, tps: {len(buffer) / elapsed}")
+                    t0 = time.perf_counter()
+                    print(f"write to buffer: {len(buffer)}. total: {total}")
+                    # append buffer to file
+                    ndarray = np.array(buffer, dtype=np.uint16)
+                    ndarray.tofile(g)
+                    buffer = []
+            if buffer:
+                ndarray = np.array(buffer, dtype=np.uint16)
+                ndarray.tofile(g)
+                total += len(buffer)
+
+        print(f"total written: {total}")
 
     def decode(self, ids: list[int]) -> str:
         b = b"".join(self.vocab[id] for id in ids)
         return b.decode("utf-8", errors="replace")
+
+
+def bpe_encode_chunk(
+    idx: int,
+    in_file: str,
+    out_file_prefix: str,  # use for prefix
+    start: int,
+    end: int,
+    vocab_filepath: str,
+    merges_filepath: str,
+    special_tokens: list[str] | None = None,
+):
+    tokenizer = BPETokenizer.from_files(vocab_filepath, merges_filepath, special_tokens)
+    out_file = f"{out_file_prefix}_{idx}.bin"
+
+    with open(in_file, "rb") as f, open(out_file, "wb") as g:
+        t0 = time.perf_counter()
+
+        f.seek(start)
+        string = f.read(end - start).decode("utf-8", errors="ignore")
+
+        tokens = tokenizer.encode(string)
+        ndarray = np.array(tokens, dtype=np.uint16)
+        ndarray.tofile(g)
+
+        t1 = time.perf_counter()
+        elapsed = t1 - t0
+        print(
+            f"chunk {idx}, elapsed: {elapsed:.6f}, encode: {len(tokens)}, tps: {len(tokens) / elapsed:.6f}"
+        )
+
+    return len(tokens)
+
+
+def parallel_bpe_encode_file(
+    in_file: str,
+    out_file: str,
+    num_processes: int,
+    vocab_filepath: str,
+    merges_filepath: str,
+    special_tokens: list[str] | None = None,
+):
+    boundaries = get_chunk_boundaries(in_file, num_processes, split_token=SPLIT_TOKEN)
+
+    chunks = [
+        (
+            idx,
+            in_file,
+            out_file,
+            start,
+            end,
+            vocab_filepath,
+            merges_filepath,
+            special_tokens,
+        )
+        for idx, (start, end) in enumerate(zip(boundaries[:-1], boundaries[1:]))
+    ]
+    with multiprocessing.Pool(num_processes) as pool:
+        totals = pool.starmap(bpe_encode_chunk, chunks)
+
+    total = sum(totals)
+    print(f"total encode {total} tokens")
+
+    print(f"merge to file: {out_file}")
+    with open(out_file, "wb") as f:
+        for idx in range(len(chunks)):
+            shard_file = f"{out_file}_{idx}.bin"
+            with open(shard_file, "rb") as shard:
+                shutil.copyfileobj(shard, f)
+
+            os.remove(shard_file)
 
 
 # TESTING
@@ -471,3 +578,26 @@ class BPETokenizer:
 
 
 # tokenizer = BPETokenizer.from_files("/data/users/wilsonhong/projects/stanford-cs336/assignment1-basics/tmp/owt_vocab.pickle", "/data/users/wilsonhong/projects/stanford-cs336/assignment1-basics/tmp/owt_merges.pickle", ["<|endoftext|>"])
+
+
+# Reading (for training):
+#   - np.memmap(path, dtype=np.uint16, mode="r") — on-disk array, flat 1-D. Docs: numpy.memmap
+#   (https://numpy.org/doc/stable/reference/generated/numpy.memmap.html). Pass the same dtype you
+#   wrote.
+#   - (alt) np.fromfile(path, dtype=np.uint16) — reads the whole thing into RAM; fine for a quick
+#   sanity check, not for the big file.
+#   - torch.from_numpy(...) then .long() — cast the sampled batch (small), not the whole array.
+
+#   Your generator side (already built):
+#   - tokenizer.encode_iterable(f) → Iterator[int].
+
+# from cs336_basics.bpe import BPETokenizer
+
+# tokenizer = BPETokenizer.from_files(
+#     "data/tiny_stories/ts_vocab.pickle",
+#     "data/tiny_stories/ts_merges.pickle",
+#     ["<|endoftext|>"],
+# )
+# tokenizer.encode_file(
+#     "data/TinyStoriesV2-GPT4-valid.txt", "data/tiny_stories/ts_valid.bin"
+# )

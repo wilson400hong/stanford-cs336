@@ -3,7 +3,9 @@ import heapq
 import json
 import multiprocessing
 import os
+import pickle
 import time
+from typing import Iterable, Iterator
 
 import regex as re
 
@@ -365,8 +367,20 @@ class BPETokenizer:
     ):
         self.vocab = vocab
         self.merges = merges
-        self.special_tokens = special_tokens
-        self.index: dict[bytes, int] = {v: k for k, v in self.vocab.items()}
+        if special_tokens:
+            self.special_tokens = sorted(special_tokens, key=len, reverse=True)
+            self.special_tokens_pattern = (
+                "("
+                + "|".join([f"{re.escape(token)}" for token in self.special_tokens])
+                + ")"
+            )
+        else:
+            self.special_tokens = []
+            self.special_tokens_pattern = None
+        # print(self.special_tokens_pattern)
+        self.bytes_index: dict[bytes, int] = {v: k for k, v in self.vocab.items()}
+        self.merge_rank = {m: rank for rank, m in enumerate(self.merges)}
+        self.pretoken_cache: dict[str, list[int]] = {}
 
     @classmethod
     def from_files(
@@ -375,13 +389,94 @@ class BPETokenizer:
         merges_filepath: str,
         special_tokens: list[str] | None = None,
     ):
-        vocab = json.load(open(vocab_filepath, "r"))
-        merges = json.load(open(merges_filepath, "r"))
+        vocab = pickle.load(open(vocab_filepath, "rb"))
+        merges = pickle.load(open(merges_filepath, "rb"))
         return cls(vocab, merges, special_tokens)
 
+    # TODO: need ot optimize. too slow
     def encode(self, text: str) -> list[int]:
-        # 1. split
-        raise NotImplementedError("")
+        res = []
+        if self.special_tokens_pattern:
+            parts = re.split(self.special_tokens_pattern, text)
+        else:
+            parts = [text]
+
+        for part in parts:
+            if part in self.special_tokens:  # TODO: this might can be faster
+                res.append(self.bytes_index[part.encode("utf-8")])
+            else:
+                for m in re.finditer(PRETOKENIZE_PAT, part):
+                    res.extend(self.encode_pretoken(m.group()))
+        return res
+
+    def encode_pretoken(self, pretoken: str) -> list[int]:
+        """pretoken should never be a special token"""
+        assert pretoken not in self.special_tokens
+
+        # TODO: measure
+        if pretoken in self.pretoken_cache:
+            return self.pretoken_cache[pretoken]
+
+        bt = str_to_bt(pretoken)
+        done = False
+
+        BIG = len(self.merges) + 10000  # much larger than |vocab|
+
+        while len(bt) >= 2 and not done:
+            done = True
+            bp_to_merge = None
+            merge_rank = BIG  # very big
+
+            for bp in itertools.pairwise(bt):
+                if (rank := self.merge_rank.get(bp, BIG)) < merge_rank:
+                    done = False
+                    merge_rank = rank
+                    bp_to_merge = bp
+
+            if bp_to_merge:
+                bt, _, _ = merge_bp(bt, bp_to_merge)
+
+        tokens = [self.bytes_index[b] for b in bt]
+        self.pretoken_cache[pretoken] = tokens
+        return tokens
+
+    def encode_iterable(self, iterable: Iterable[str]) -> Iterator[int]:
+        for text in iterable:
+            yield from self.encode(text)
+
+    def encode_file(self, in_file: str, out_file: str):
+        # write as np array binary format, uint16
+        buffer = []
+        BUFFER_MAX = 1e5
+        count = 0
+        total = 0
+        t0 = time.perf_counter()
+        with open(in_file, "r") as f:
+            with open(out_file, "wb") as g:
+                for token in self.encode_iterable(f):
+                    if count < 20:
+                        print(token, self.vocab[token])
+                    # assert token < 2**16, "token id > uint16"
+                    buffer.append(token)
+                    if len(buffer) >= BUFFER_MAX:
+                        total += len(buffer)
+                        elapsed = time.perf_counter() - t0
+                        # print(f"elapsed: {elapsed}, tps: {len(buffer) / elapsed}")
+                        t0 = time.perf_counter()
+                        # print(f"write to buffer: {len(buffer)}. total: {total}")
+                        # append buffer to file
+                        ndarray = np.array(buffer, dtype=np.uint16)
+                        ndarray.tofile(g)
+                        buffer = []
+
+                    count += 1
+                if buffer:
+                    ndarray = np.array(buffer, dtype=np.uint16)
+                    ndarray.tofile(g)
+                    total += len(buffer)
+
+        print(f"total written: {total}")
 
     def decode(self, ids: list[int]) -> str:
-        raise NotImplementedError("")
+        b = b"".join(self.vocab[id] for id in ids)
+        return b.decode("utf-8", errors="replace")
