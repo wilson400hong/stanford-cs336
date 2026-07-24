@@ -9,7 +9,17 @@ TS_TRAIN_TXT = "data/TinyStoriesV2-GPT4-train.txt"
 
 TS_VALID_TOKENS = "data/tiny_stories/ts_valid.bin"
 TS_TRAIN_TOKENS = "data/tiny_stories/ts_train.bin"
-TS_TRAIN_TOKENS_2 = "data/tiny_stories/ts_train2.bin"
+
+OWT_VOCAB = "data/owt/owt_vocab.pickle"
+OWT_MERGES = "data/owt/owt_merges.pickle"
+
+
+OWT_VALID_TXT = "data/owt_valid.txt"
+OWT_TRAIN_TXT = "data/owt_train.txt"
+
+OWT_VALID_TOKENS = "data/owt/owt_valid.bin"
+OWT_TRAIN_TOKENS = "data/owt/owt_train.bin"
+
 
 """
 tokenizer = BPETokenizer.from_files(TS_VOCAB, TS_MERGES, ["<|endoftext|>"])

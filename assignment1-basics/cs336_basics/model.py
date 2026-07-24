@@ -5,7 +5,7 @@ from einops import einsum, rearrange, repeat
 from jaxtyping import Bool, Float, Int
 from torch import Tensor
 
-from .nn_utils import softmax
+from .nn_utils import appy_top_p, softmax
 
 # TODO: replace 2-D weights with Linear. This might need fix load_state_dict. Not urgent now
 
@@ -324,10 +324,12 @@ class TransformerLM(torch.nn.Module):
         )
         self.ln_final = RMSNorm(d_model, eps, device, dtype)
         self.lm_head = Linear(d_model, vocab_size, device, dtype)
+        self.context_length = context_length
 
     def forward(
         self, in_indices: Int[Tensor, " batch_size sequence_length"]
     ) -> torch.Tensor:
+        # TODO: check, can seq_len > context_length?
         seq_len = in_indices.shape[-1]
         token_positions = torch.arange(seq_len, device=in_indices.device)
         x = self.token_embeddings(in_indices)
@@ -335,6 +337,49 @@ class TransformerLM(torch.nn.Module):
             x = transformer(x, token_positions)
         y = self.ln_final(x)
         return self.lm_head(y)
+
+    @torch.no_grad()
+    def decode(
+        self,
+        prompts: list[int],
+        max_tokens: int = 100000,  # something very big
+        EOT: int = 0,
+        temp: float | None = None,
+        top_p: float | None = None,
+    ) -> list[int]:
+        """
+        EOT: id of token "<|endoftext|>"
+        """
+
+        was_training = self.training
+        self.eval()
+
+        window = prompts.copy()
+        next_token: int | None = None
+        generated = []
+
+        while len(generated) < max_tokens and next_token != EOT:
+            inputs = torch.tensor(
+                window, dtype=torch.long, device=next(self.parameters()).device
+            )
+            logits = self.forward(inputs)
+
+            # temperature softmax
+            probs = softmax(logits[-1], dim=-1, temp=temp)
+
+            # nucleus top-p sampling
+            if top_p is not None:
+                probs = appy_top_p(probs, top_p)
+
+            next_token = torch.multinomial(probs, num_samples=1).item()
+            generated.append(next_token)
+
+            window.append(next_token)
+            if len(window) > self.context_length:
+                window = window[-self.context_length :]
+
+        self.train(was_training)  # restore
+        return generated
 
 
 # class ModernRotaryPositionalEmbedding(torch.nn.Module):
