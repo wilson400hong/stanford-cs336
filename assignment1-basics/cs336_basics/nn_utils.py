@@ -51,7 +51,7 @@ def gradient_clipping(
         p.grad.mul_(max_norm / (total_norm + eps))
 
 
-def appy_top_p(probs: torch.Tensor, top_p: float = 0.9):
+def apply_top_p(probs: torch.Tensor, top_p: float = 0.9):
     if top_p >= 1.0:
         return probs
 
@@ -60,7 +60,7 @@ def appy_top_p(probs: torch.Tensor, top_p: float = 0.9):
 
     sorted_indices_to_remove = cum_probs > top_p  # >= is precise, but > is safer
     # shift mask right. `clone()` is necessary for in-place shift
-    sorted_indices_to_remove[..., 1:] = indices_to_remove[..., :-1].clone()
+    sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
     sorted_indices_to_remove[..., 0] = False  # always keep the first
 
     # indices_to_remove[i] will be True if probs[i] should be removed

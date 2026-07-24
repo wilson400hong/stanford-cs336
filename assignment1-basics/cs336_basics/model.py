@@ -5,7 +5,7 @@ from einops import einsum, rearrange, repeat
 from jaxtyping import Bool, Float, Int
 from torch import Tensor
 
-from .nn_utils import appy_top_p, softmax
+from .nn_utils import apply_top_p, softmax
 
 # TODO: replace 2-D weights with Linear. This might need fix load_state_dict. Not urgent now
 
@@ -343,14 +343,10 @@ class TransformerLM(torch.nn.Module):
         self,
         prompts: list[int],
         max_tokens: int = 100000,  # something very big
-        EOT: int = 0,
+        EOT: int = 0,  # id of token "<|endoftext|>"
         temp: float | None = None,
         top_p: float | None = None,
     ) -> list[int]:
-        """
-        EOT: id of token "<|endoftext|>"
-        """
-
         was_training = self.training
         self.eval()
 
@@ -369,7 +365,7 @@ class TransformerLM(torch.nn.Module):
 
             # nucleus top-p sampling
             if top_p is not None:
-                probs = appy_top_p(probs, top_p)
+                probs = apply_top_p(probs, top_p)
 
             next_token = torch.multinomial(probs, num_samples=1).item()
             generated.append(next_token)
