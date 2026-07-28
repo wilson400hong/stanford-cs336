@@ -11,22 +11,24 @@ from .nn_utils import apply_top_p, softmax
 class Linear(torch.nn.Module):
     def __init__(
         self,
-        in_features: int,
-        out_features: int,
+        d_in: int,
+        d_out: int,
         device: torch.device | None = None,
         dtype: torch.dtype | None = None,
     ):
+        """
+        Args:
+            d_in: input features num
+            d_out: output features num
+        """
         super().__init__()
+        std = math.sqrt(2 / (d_in + d_out))
         self.weight = torch.nn.Parameter(
-            torch.empty(
-                (out_features, in_features),  # since we use x @ w.T
-                dtype=dtype,
-                device=device,
-            )
+            torch.nn.init.trunc_normal_(
+                torch.empty((d_out, d_in), dtype=dtype, device=device), std=std, a=-3 * std, b=3 * std
+            ),
+            requires_grad=True,
         )
-        var = 2 / (in_features + out_features)
-        std = math.sqrt(var)
-        torch.nn.init.trunc_normal_(self.weight, std=std, a=-3 * std, b=3 * std)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return einsum(x, self.weight, "... d_in, d_out d_in -> ... d_out")  # x @ weight.T
@@ -35,20 +37,26 @@ class Linear(torch.nn.Module):
 class Embedding(torch.nn.Module):
     def __init__(
         self,
-        num_embeddings: int,
-        embedding_dim: int,
+        vocab_size: int,
+        d_model: int,
         device: torch.device | None = None,
         dtype: torch.dtype | None = None,
     ):
         super().__init__()
+        std = 1.0
         self.weight = torch.nn.Parameter(
-            torch.empty(
-                (num_embeddings, embedding_dim),
-                dtype=dtype,
-                device=device,
-            )
+            torch.nn.init.trunc_normal_(
+                torch.empty(
+                    (vocab_size, d_model),
+                    dtype=dtype,
+                    device=device,
+                ),
+                std=std,
+                a=-3 * std,
+                b=3 * std,
+            ),
+            requires_grad=True,
         )
-        torch.nn.init.trunc_normal_(self.weight, std=1.0, a=-3.0, b=3.0)
 
     def forward(self, token_ids: torch.Tensor) -> torch.Tensor:
         return self.weight[token_ids]
@@ -69,8 +77,7 @@ class RMSNorm(torch.nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         in_dtype = x.dtype
         x = x.to(torch.float32)
-        variance = torch.mean(torch.pow(x, 2), dim=-1, keepdim=True)
-        x_normed = x * torch.rsqrt(variance + self.eps)
+        x_normed = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
         # NOTE: in_dtype may cause mixed precision bad
         return x_normed.to(in_dtype) * self.weight
 
