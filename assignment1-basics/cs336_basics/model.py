@@ -7,8 +7,6 @@ from torch import Tensor
 
 from .nn_utils import apply_top_p, softmax
 
-# TODO: replace 2-D weights with Linear. This might need fix load_state_dict. Not urgent now
-
 
 def init_linear_weights(
     in_dim: int,
