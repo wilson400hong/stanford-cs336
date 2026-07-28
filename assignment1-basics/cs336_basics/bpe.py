@@ -380,6 +380,8 @@ class BPETokenizer:
         self.merge_rank = {m: rank for rank, m in enumerate(self.merges)}
         self.pretoken_cache: dict[str, list[int]] = {}
 
+        self.eot_token = self.bytes_index[SPLIT_TOKEN.encode("utf-8")]
+
     @classmethod
     def from_files(
         cls,

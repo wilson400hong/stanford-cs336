@@ -341,20 +341,20 @@ class TransformerLM(torch.nn.Module):
     @torch.no_grad()
     def decode(
         self,
-        prompts: list[int],
-        max_tokens: int = 100000,  # something very big
-        EOT: int = 0,  # id of token "<|endoftext|>"
+        prompt: list[int],
+        eot_token,
+        max_tokens: int = 256,
         temp: float | None = None,
         top_p: float | None = None,
     ) -> list[int]:
         was_training = self.training
         self.eval()
 
-        window = prompts.copy()
+        window = prompt.copy()
         next_token: int | None = None
         generated = []
 
-        while len(generated) < max_tokens and next_token != EOT:
+        while len(generated) < max_tokens and next_token != eot_token:
             inputs = torch.tensor(
                 window, dtype=torch.long, device=next(self.parameters()).device
             )
@@ -369,6 +369,8 @@ class TransformerLM(torch.nn.Module):
 
             next_token = torch.multinomial(probs, num_samples=1).item()
             generated.append(next_token)
+
+            # print(f"next_token: {next_token}")
 
             window.append(next_token)
             if len(window) > self.context_length:
