@@ -8,24 +8,6 @@ from torch import Tensor
 from .nn_utils import apply_top_p, softmax
 
 
-def init_linear_weights(
-    in_dim: int,
-    out_dim: int,
-    device: torch.device | None = None,
-    dtype: torch.dtype | None = None,
-) -> torch.Tensor:
-    w = torch.empty(
-        (out_dim, in_dim),  # since we use x @ w.T
-        dtype=dtype,
-        device=device,
-    )
-
-    var = 2 / (in_dim + out_dim)
-    std = math.sqrt(var)
-    torch.nn.init.trunc_normal_(w, std=std, a=-3 * std, b=3 * std)
-    return w
-
-
 class Linear(torch.nn.Module):
     def __init__(
         self,
@@ -47,9 +29,7 @@ class Linear(torch.nn.Module):
         torch.nn.init.trunc_normal_(self.weight, std=std, a=-3 * std, b=3 * std)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return einsum(
-            x, self.weight, "... d_in, d_out d_in -> ... d_out"
-        )  # x @ weight.T
+        return einsum(x, self.weight, "... d_in, d_out d_in -> ... d_out")  # x @ weight.T
 
 
 class Embedding(torch.nn.Module):
@@ -84,9 +64,7 @@ class RMSNorm(torch.nn.Module):
     ):
         super().__init__()
         self.eps = eps
-        self.weight = torch.nn.Parameter(
-            torch.ones(d_model, dtype=dtype, device=device)
-        )
+        self.weight = torch.nn.Parameter(torch.ones(d_model, dtype=dtype, device=device))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         in_dtype = x.dtype
@@ -134,9 +112,7 @@ class RotaryPositionalEmbedding(torch.nn.Module):
     ):
         super().__init__()
 
-        inv_freq = 1.0 / (
-            theta ** (torch.arange(0, d_k, 2, dtype=torch.float32, device=device) / d_k)
-        )
+        inv_freq = 1.0 / (theta ** (torch.arange(0, d_k, 2, dtype=torch.float32, device=device) / d_k))
         self.register_buffer("inv_freq", inv_freq, persistent=False)
         self._init_cache(max_seq_len, device)
 
@@ -145,9 +121,7 @@ class RotaryPositionalEmbedding(torch.nn.Module):
         t = torch.arange(max_seq_len, dtype=torch.float32, device=device)
 
         # (max_seq_len, d_k/2)
-        freqs = torch.outer(
-            t, self.inv_freq
-        )  # freqs = torch.einsum("i, j -> i j", t, self.inv_freq)
+        freqs = torch.outer(t, self.inv_freq)  # freqs = torch.einsum("i, j -> i j", t, self.inv_freq)
 
         # [00, 01] -> [θ0, θ0, θ1, θ1]
         # (max_seq_len, d_k)
@@ -186,9 +160,7 @@ def scaled_dot_product_attention(
 ) -> torch.Tensor:
     d_k = Q.shape[-1]
 
-    scores = einsum(
-        Q, K, "... queries dk, ... keys dk -> ... queries keys"
-    ) / math.sqrt(d_k)
+    scores = einsum(Q, K, "... queries dk, ... keys dk -> ... queries keys") / math.sqrt(d_k)
     if mask is not None:
         attn_mask = torch.where(mask, 0.0, float("-inf"))
         scores = scores + attn_mask
@@ -216,16 +188,10 @@ class MultiheadSelfAttention(torch.nn.Module):
         self.v_proj = Linear(d_model, d_model, device, dtype)
         self.output_proj = Linear(d_model, d_model, device, dtype)
 
-        causal_mask = torch.tril(
-            torch.ones(max_seq_len, max_seq_len, dtype=torch.bool, device=device)
-        )
+        causal_mask = torch.tril(torch.ones(max_seq_len, max_seq_len, dtype=torch.bool, device=device))
         self.register_buffer("causal_mask", causal_mask, persistent=False)
 
-        self.rope = (
-            RotaryPositionalEmbedding(theta, d_k, max_seq_len, device)
-            if theta is not None
-            else None
-        )
+        self.rope = RotaryPositionalEmbedding(theta, d_k, max_seq_len, device) if theta is not None else None
 
     def forward(
         self,
@@ -276,9 +242,7 @@ class TransformerBlock(torch.nn.Module):
         self.ln1 = RMSNorm(d_model, eps, device=device, dtype=dtype)
         self.ln2 = RMSNorm(d_model, eps, device=device, dtype=dtype)
         self.ffn = SwiGLU(d_model, d_ff, device, dtype)
-        self.attn = MultiheadSelfAttention(
-            d_model, num_heads, max_seq_len, theta, device, dtype
-        )
+        self.attn = MultiheadSelfAttention(d_model, num_heads, max_seq_len, theta, device, dtype)
 
     def forward(
         self,
@@ -324,9 +288,7 @@ class TransformerLM(torch.nn.Module):
         self.lm_head = Linear(d_model, vocab_size, device, dtype)
         self.context_length = context_length
 
-    def forward(
-        self, in_indices: Int[Tensor, " batch_size sequence_length"]
-    ) -> torch.Tensor:
+    def forward(self, in_indices: Int[Tensor, " batch_size sequence_length"]) -> torch.Tensor:
         # TODO: check, can seq_len > context_length?
         seq_len = in_indices.shape[-1]
         token_positions = torch.arange(seq_len, device=in_indices.device)
@@ -353,9 +315,7 @@ class TransformerLM(torch.nn.Module):
         generated = []
 
         while len(generated) < max_tokens and next_token != eot_token:
-            inputs = torch.tensor(
-                window, dtype=torch.long, device=next(self.parameters()).device
-            )
+            inputs = torch.tensor(window, dtype=torch.long, device=next(self.parameters()).device)
             logits = self.forward(inputs)
 
             # temperature softmax
