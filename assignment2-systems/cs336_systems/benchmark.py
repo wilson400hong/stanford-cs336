@@ -1,0 +1,170 @@
+import statistics
+import argparse
+
+import torch
+import timeit
+
+from cs336_basics.model import BasicsTransformerLM
+from cs336_basics.nn_utils import cross_entropy, clip_gradient
+from cs336_basics.optimizer import AdamW, get_cosine_lr
+
+
+
+def get_random_batch(
+    batch_size: int, vocab_size, context_length: int, device: str
+) -> tuple[torch.Tensor, torch.Tensor]:
+
+    batch_tokens = [torch.randint(vocab_size, (context_length+1,), dtype=torch.long, device=device) for _ in range(batch_size)]
+
+    x = torch.stack([tokens[:context_length] for tokens in batch_tokens])
+    y = torch.stack([tokens[1:] for tokens in batch_tokens])
+    return x, y
+
+
+def sync():
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+
+
+def run_step(inputs, targets, step, model, optimizer, max_norm, lr_max, lr_min, t_w, t_c, run_forward, run_backward, run_optimizer):
+    optimizer.zero_grad()
+    assert run_forward if run_backward else True
+
+    forward_time = backward_time = optimizer_time = None
+
+    if run_forward:
+        sync()
+        t0 = timeit.default_timer()
+        logits = model(inputs)
+        loss = cross_entropy(logits, targets)
+        sync()
+        forward_time = timeit.default_timer() - t0
+
+    if run_backward:
+        sync()
+        t0 = timeit.default_timer()
+        loss.backward()
+        sync()
+        backward_time = timeit.default_timer() - t0
+
+    if run_optimizer:
+        sync()
+        t0 = timeit.default_timer()
+        clip_gradient(model.parameters(), max_norm)
+        for g in optimizer.param_groups:
+            g["lr"] = get_cosine_lr(lr_max, lr_min, t_w, t_c, step+1)
+        optimizer.step()
+        sync()
+        optimizer_time = timeit.default_timer() - t0
+
+    return forward_time, backward_time, optimizer_time
+
+
+
+def benchmark(
+    *,
+    # benchmark
+    batch_size: int = 4,
+    warmup_steps: int,  # no warmup
+    benchmark_steps: int,
+    run_forward: bool = False,
+    run_backward: bool = False,
+    run_optimizer: bool = False,
+    # model
+    vocab_size: int = 10000,
+    context_length: int = 512,
+    d_model: int,
+    d_ff: int,
+    num_layers: int,
+    num_heads: int,
+    rope_theta: float = 10000,
+    # gradient clipping
+    max_norm: float = 1.0,
+    # optimizer
+    lr_max: float = 1e-3,
+    lr_min: float = 1e-4,
+    t_w: int = 100,
+    t_c: int = 10,
+    # betas: tuple[float, float] = (0.9, 0.999),
+    # weight_decay: float = 0.01,
+):
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    print(device)
+    # vocab_size = get_vocab_size(vocab_path)  # NOTE: keep it now
+    # print("vocab_size:", vocab_size)
+    print("Init model...")
+    model = BasicsTransformerLM(
+        vocab_size,
+        context_length,
+        d_model,
+        num_layers,
+        num_heads,
+        d_ff,
+        rope_theta,
+    )
+    model.to(device)
+
+    print("Init optimizer...")
+    optimizer = AdamW(model.parameters())  # use default values
+
+
+    # reuse random inputs
+    inputs, targets = get_random_batch(batch_size, vocab_size, context_length, device)
+
+    print("Warmup...")
+    for step in range(warmup_steps):
+        run_step(inputs, targets, step, model, optimizer, max_norm, lr_max, lr_min, t_w, t_c, run_forward, run_backward, run_optimizer)
+        
+
+    sync()
+
+    print("Benchmarking...")
+    forward_times = []
+    backward_times = []
+    optimizer_times = []
+    for step in range(benchmark_steps):
+        ft, bt, ot = run_step(inputs, targets, step, model, optimizer, max_norm, lr_max, lr_min, t_w, t_c, run_forward, run_backward, run_optimizer)
+        forward_times.append(ft)
+        backward_times.append(bt)
+        optimizer_times.append(ot)
+
+    if run_forward:
+        print(f"[Forward] mean={statistics.mean(forward_times):.6f}, std={statistics.stdev(forward_times):.6f}")
+    if run_backward:
+        print(f"[Backard] mean={statistics.mean(backward_times):.6f}, std={statistics.stdev(backward_times):.6f}")  
+    if run_optimizer:
+        print(f"[Optimizer] mean={statistics.mean(optimizer_times):.6f}, std={statistics.stdev(optimizer_times):.6f}")
+    
+    print("Done")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Train TransformerLM")
+
+    parser.add_argument("--warmup_steps", type=int, default=5)
+    parser.add_argument("--benchmark_steps", type=int, default=10)
+
+    parser.add_argument("--run_forward", action="store_true")
+    parser.add_argument("--run_backward", action="store_true")
+    parser.add_argument("--run_optimizer", action="store_true")
+ 
+    parser.add_argument("--d_model", type=int, default=768)
+    parser.add_argument("--d_ff", type=int, default=3072)
+    parser.add_argument("--num_layers", type=int, default=12)
+    parser.add_argument("--num_heads", type=int, default=12)
+
+
+    args = parser.parse_args()
+    # argparse gives list for nargs, train() expects tuple
+
+    benchmark(**vars(args))
+
+
+if __name__ == "__main__":
+    main()
+
+
+"""
+uv run python -m cs336_systems.benchmark --run_forward --run_backward --run_optimizer --d_model 768 --d_ff 3072 --num_layers 12 --num_heads 12 
+"""
