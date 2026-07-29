@@ -14,6 +14,8 @@ from einops import einsum, rearrange
 from jaxtyping import Bool, Float, Int
 from torch import Tensor
 
+import torch.cuda.nvtx as nvtx
+
 logger = logging.getLogger(__name__)
 
 
@@ -31,9 +33,7 @@ class Linear(nn.Module):
         super().__init__()
         std = math.sqrt(2 / (d_in + d_out))
         self.weight: Float[Tensor, " d_out d_in"] = nn.Parameter(
-            nn.init.trunc_normal_(
-                torch.empty(d_out, d_in), std=std, a=-3 * std, b=3 * std
-            ),
+            nn.init.trunc_normal_(torch.empty(d_out, d_in), std=std, a=-3 * std, b=3 * std),
             requires_grad=True,
         )
 
@@ -49,9 +49,7 @@ class Embedding(nn.Module):
         super().__init__()
         std = 1.0
         self.weight = nn.Parameter(
-            nn.init.trunc_normal_(
-                torch.empty(vocab_size, d_model), std=std, a=-3 * std, b=3 * std
-            ),
+            nn.init.trunc_normal_(torch.empty(vocab_size, d_model), std=std, a=-3 * std, b=3 * std),
             requires_grad=True,
         )
 
@@ -123,9 +121,7 @@ class RotaryEmbedding(nn.Module):
         self._freq_cis_cache: Float[Tensor, "2 context_length half_dim"]
 
     @staticmethod
-    def _init_cache(
-        context_length: int, dim: int, theta: float
-    ) -> Float[Tensor, " 2 context_length half_dim"]:
+    def _init_cache(context_length: int, dim: int, theta: float) -> Float[Tensor, " 2 context_length half_dim"]:
         assert dim % 2 == 0
 
         d = torch.arange(0, dim, 2) / dim
@@ -202,9 +198,7 @@ class BasicsTransformerLM(nn.Module):
     ):
         # Store the model configuration for serialization / deserialization
         self.config = {
-            k: v
-            for k, v in locals().items()
-            if k != "self" and not (k.startswith("__") and k.endswith("__"))
+            k: v for k, v in locals().items() if k != "self" and not (k.startswith("__") and k.endswith("__"))
         }
         super().__init__()
         self.context_length = context_length
@@ -212,9 +206,7 @@ class BasicsTransformerLM(nn.Module):
         self.token_embeddings = Embedding(vocab_size, d_model)
         d_head = d_model // num_heads
         self.positional_encoder = (
-            RotaryEmbedding(context_length, d_head, rope_theta)
-            if rope_theta is not None
-            else None
+            RotaryEmbedding(context_length, d_head, rope_theta) if rope_theta is not None else None
         )
 
         self.layers = nn.ModuleList(
@@ -234,9 +226,7 @@ class BasicsTransformerLM(nn.Module):
         # matrix between the two embedding layers and the pre-softmax linear transformation"
         # self.lm_head.weight = self.token_embeddings.weight
         # report number of parameters
-        logger.info(
-            f"number of non-embedding parameters: {self.get_num_params() / 1e6:.2f}M"
-        )
+        logger.info(f"number of non-embedding parameters: {self.get_num_params() / 1e6:.2f}M")
 
     def get_num_params(self) -> int:
         """
@@ -248,9 +238,7 @@ class BasicsTransformerLM(nn.Module):
         n_params = sum(p.numel() for p in self.parameters())
         return n_params
 
-    def forward(
-        self, x: Int[Tensor, " ... sequence_length"]
-    ) -> Float[Tensor, " ... sequence_length vocab_size"]:
+    def forward(self, x: Int[Tensor, " ... sequence_length"]) -> Float[Tensor, " ... sequence_length vocab_size"]:
         """
         Args:
             x: Input IDs for language modeling.
@@ -324,12 +312,8 @@ class BasicsTransformerLM(nn.Module):
                 # Get the score of the kth item that we kept---items with lower scores should be masked.
                 threshold = topk_values[:, -1]
                 topk_mask = temperature_scaled_next_token_logits < threshold
-                temperature_scaled_next_token_logits.masked_fill(
-                    topk_mask, float("-inf")
-                )
-            next_token_probabilities = softmax(
-                temperature_scaled_next_token_logits, dim=-1
-            )
+                temperature_scaled_next_token_logits.masked_fill(topk_mask, float("-inf"))
+            next_token_probabilities = softmax(temperature_scaled_next_token_logits, dim=-1)
             next_token_id = torch.multinomial(next_token_probabilities, 1)
             # End generation if we see the EOS token ID
             if eos_token_id is not None and next_token_id.item() == eos_token_id:
@@ -424,6 +408,7 @@ class SwiGLU(nn.Module):
         return self.w2(silu(self.w1(x)) * self.w3(x))
 
 
+# @nvtx.range("scaled dot product attention")
 def scaled_dot_product_attention(
     Q: Float[Tensor, " ... queries d_k"],
     K: Float[Tensor, " ... keys    d_k"],
@@ -448,18 +433,17 @@ def scaled_dot_product_attention(
         implementation with the provided key, query, and value tensors.
     """
 
+    # with nvtx.range("compute attention scores"):
     d_k = K.shape[-1]
-    attention_scores = einsum(
-        Q, K, "... query d_k, ... key d_k -> ... query key"
-    ) / math.sqrt(d_k)
+    attention_scores = einsum(Q, K, "... query d_k, ... key d_k -> ... query key") / math.sqrt(d_k)
 
     if mask is not None:
         attention_scores = torch.where(mask, attention_scores, float("-inf"))
 
-    attention_weights = softmax(
-        attention_scores, dim=-1
-    )  # Softmax over the key dimension
+    # with nvtx.range("compute softmax"):
+    attention_weights = softmax(attention_scores, dim=-1)  # Softmax over the key dimension
 
+    # with nvtx.range("final matmul"):
     return einsum(attention_weights, V, "... query key, ... key d_v ->  ... query d_v")
 
 
@@ -545,18 +529,14 @@ class CausalMultiHeadSelfAttention(nn.Module):
         qi = rearrange(iota, "query -> query 1")
         kj = rearrange(iota, "key   -> 1   key")
         causal_mask = qi >= kj  # (query, key)
-        causal_mask = causal_mask.__getitem__(
-            (None,) * len(batch_dims) + (...,)
-        )  # Add appropriate leading dimensions
+        causal_mask = causal_mask.__getitem__((None,) * len(batch_dims) + (...,))  # Add appropriate leading dimensions
 
         # Shape: (..., num_heads, sequence_length, d_k)
         attn_output = scaled_dot_product_attention(K=K, Q=Q, V=V, mask=causal_mask)
 
         # Concatenate the attention output from all heads.
         # (..., sequence_length, num_heads * d_v).
-        attn_output = rearrange(
-            attn_output, "batch heads seq d_v -> batch seq (heads d_v)"
-        ).contiguous()
+        attn_output = rearrange(attn_output, "batch heads seq d_v -> batch seq (heads d_v)").contiguous()
 
         # Apply the output projection
         output = self.output_proj(attn_output)

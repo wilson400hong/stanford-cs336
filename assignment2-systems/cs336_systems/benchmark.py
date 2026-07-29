@@ -2,6 +2,8 @@ import statistics
 import argparse
 
 import torch
+
+# import torch.cuda.nvtx as nvtx
 import timeit
 
 from cs336_basics.model import BasicsTransformerLM
@@ -9,12 +11,8 @@ from cs336_basics.nn_utils import cross_entropy, clip_gradient
 from cs336_basics.optimizer import AdamW, get_cosine_lr
 
 
-
-def get_random_batch(
-    batch_size: int, vocab_size, context_length: int, device: str
-) -> tuple[torch.Tensor, torch.Tensor]:
-
-    batch_tokens = [torch.randint(vocab_size, (context_length+1,), dtype=torch.long, device=device) for _ in range(batch_size)]
+def get_random_batch(batch_size: int, vocab_size, context_length: int, device: str) -> tuple[torch.Tensor, torch.Tensor]:
+    batch_tokens = [torch.randint(vocab_size, (context_length + 1,), dtype=torch.long, device=device) for _ in range(batch_size)]
 
     x = torch.stack([tokens[:context_length] for tokens in batch_tokens])
     y = torch.stack([tokens[1:] for tokens in batch_tokens])
@@ -52,13 +50,12 @@ def run_step(inputs, targets, step, model, optimizer, max_norm, lr_max, lr_min, 
         t0 = timeit.default_timer()
         clip_gradient(model.parameters(), max_norm)
         for g in optimizer.param_groups:
-            g["lr"] = get_cosine_lr(lr_max, lr_min, t_w, t_c, step+1)
+            g["lr"] = get_cosine_lr(lr_max, lr_min, t_w, t_c, step + 1)
         optimizer.step()
         sync()
         optimizer_time = timeit.default_timer() - t0
 
     return forward_time, backward_time, optimizer_time
-
 
 
 def benchmark(
@@ -67,9 +64,9 @@ def benchmark(
     batch_size: int = 4,
     warmup_steps: int,  # no warmup
     benchmark_steps: int,
-    run_forward: bool = False,
-    run_backward: bool = False,
-    run_optimizer: bool = False,
+    run_forward: bool = True,
+    run_backward: bool = True,
+    run_optimizer: bool = True,
     # model
     vocab_size: int = 10000,
     context_length: int = 512,
@@ -108,17 +105,16 @@ def benchmark(
     print("Init optimizer...")
     optimizer = AdamW(model.parameters())  # use default values
 
-
     # reuse random inputs
     inputs, targets = get_random_batch(batch_size, vocab_size, context_length, device)
 
     print("Warmup...")
     for step in range(warmup_steps):
         run_step(inputs, targets, step, model, optimizer, max_norm, lr_max, lr_min, t_w, t_c, run_forward, run_backward, run_optimizer)
-        
 
     sync()
 
+    # with torch.cuda.profiler.profile():
     print("Benchmarking...")
     forward_times = []
     backward_times = []
@@ -132,28 +128,49 @@ def benchmark(
     if run_forward:
         print(f"[Forward] mean={statistics.mean(forward_times):.6f}, std={statistics.stdev(forward_times):.6f}")
     if run_backward:
-        print(f"[Backard] mean={statistics.mean(backward_times):.6f}, std={statistics.stdev(backward_times):.6f}")  
+        print(f"[Backard] mean={statistics.mean(backward_times):.6f}, std={statistics.stdev(backward_times):.6f}")
     if run_optimizer:
         print(f"[Optimizer] mean={statistics.mean(optimizer_times):.6f}, std={statistics.stdev(optimizer_times):.6f}")
-    
+
     print("Done")
 
 
+class ToyModel(torch.nn.Module):
+    def __init__(self, in_features: int, out_features: int):
+        super().__init__()
+        self.fc1 = torch.nn.Linear(in_features, 10, bias=False)
+        self.ln = torch.nn.LayerNorm(10)
+        self.fc2 = torch.nn.Linear(10, out_features, bias=False)
+        self.relu = torch.nn.ReLU()
+
+    def forward(self, x):
+        x = self.relu(self.fc1(x))
+        x = self.ln(x)
+        x = self.fc2(x)
+        return x
+
+
+def benchmark_toy():
+    toy = ToyModel()
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    toy.to(device)
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Train TransformerLM")
+    parser = argparse.ArgumentParser(description="Benchmark TransformerLM")
 
     parser.add_argument("--warmup_steps", type=int, default=5)
-    parser.add_argument("--benchmark_steps", type=int, default=10)
+    parser.add_argument("--benchmark_steps", type=int, default=3)
 
-    parser.add_argument("--run_forward", action="store_true")
-    parser.add_argument("--run_backward", action="store_true")
-    parser.add_argument("--run_optimizer", action="store_true")
- 
+    parser.add_argument("--run_forward", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--run_backward", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--run_optimizer", action=argparse.BooleanOptionalAction, default=True)
+
     parser.add_argument("--d_model", type=int, default=768)
     parser.add_argument("--d_ff", type=int, default=3072)
     parser.add_argument("--num_layers", type=int, default=12)
     parser.add_argument("--num_heads", type=int, default=12)
-
 
     args = parser.parse_args()
     # argparse gives list for nargs, train() expects tuple
