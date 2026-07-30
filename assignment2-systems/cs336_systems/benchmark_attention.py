@@ -45,10 +45,11 @@ def benchmark(
     context_length: int,
     d_model: int,
     num_heads: int,
+    torch_compile: bool,
     rope_theta: float | None = None,
 ):
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(device)
+    # print(device)
 
     dtype = get_dtype(mixed_precision)
 
@@ -58,19 +59,23 @@ def benchmark(
     with torch.autocast(device, dtype=dtype):
         # vocab_size = get_vocab_size(vocab_path)  # NOTE: keep it now
         # print("vocab_size:", vocab_size)
-        print("Init attention...")
+        # print("Init attention...")
         model = CausalMultiHeadSelfAttention(
             d_model,
             num_heads,
             positional_encoder,
         ).to(device)
 
+        if torch_compile:
+            print("  torch.compile")
+            model = torch.compile(model)
+
     # : generate inputs
     x = torch.rand((batch_size, context_length, d_model), dtype=torch.float32, device=device)
 
     torch.cuda.memory._record_memory_history(max_entries=1000000)
 
-    print("Warmup...")
+    # print("Warmup...")
     for step in range(warmup_steps):
         y = model.forward(x)
         loss = y.sum()
@@ -82,7 +87,7 @@ def benchmark(
     backward_times = []
 
     # with torch.cuda.profiler.profile():
-    print("Benchmarking...")
+    # print("Benchmarking...")
 
     # Start recording memory history.
 
@@ -112,7 +117,7 @@ def benchmark(
     print(f"[Forward] mean={statistics.mean(forward_times):.6f}, std={statistics.stdev(forward_times):.6f}")
     print(f"[Backard] mean={statistics.mean(backward_times):.6f}, std={statistics.stdev(backward_times):.6f}")
 
-    print("Done")
+    # print("Done")
 
 
 def main():
@@ -128,6 +133,8 @@ def main():
 
     parser.add_argument("-mp", "--mixed_precision", type=str, default="bfloat16", choices=["float32", "float16", "bfloat16"])
 
+    parser.add_argument("--torch_compile", action=argparse.BooleanOptionalAction, default=False)
+
     # parser.add_argument("--gradient_checkpointing", action=argparse.BooleanOptionalAction, default=False)
     args = parser.parse_args()
 
@@ -135,10 +142,10 @@ def main():
 
     for d_model in [16, 32, 64, 128]:
         for context_length in [256, 1024, 4096, 8192, 16384]:
-            print(f"******* {d_model=}, {context_length=} ******")
+            print(f"#### {d_model=}, {context_length=}")
             args.d_model = d_model
             args.context_length = context_length
-            args.mem_prof_file = f"dm_{d_model}_ctx_{context_length}"
+            args.mem_prof_file = f"compiled_dm_{d_model}_ctx_{context_length}"
             benchmark(**vars(args))
 
 
