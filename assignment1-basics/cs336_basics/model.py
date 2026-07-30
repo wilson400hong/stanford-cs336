@@ -169,10 +169,9 @@ def scaled_dot_product_attention(
 
     scores = einsum(Q, K, "... queries dk, ... keys dk -> ... queries keys") / math.sqrt(d_k)
     if mask is not None:
-        attn_mask = torch.where(mask, 0.0, float("-inf"))
-        scores = scores + attn_mask
-    scores = softmax(scores, dim=-1)
-    return scores @ V
+        scores = torch.where(mask, scores, float("-inf"))
+    weights = softmax(scores, dim=-1)
+    return weights @ V
 
 
 class MultiheadSelfAttention(torch.nn.Module):
