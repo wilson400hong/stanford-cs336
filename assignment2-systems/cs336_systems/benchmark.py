@@ -58,8 +58,18 @@ def run_step(inputs, targets, step, model, optimizer, max_norm, lr_max, lr_min, 
     return forward_time, backward_time, optimizer_time
 
 
+def get_dtype(precision: str):
+    if precision == "float16":
+        return torch.float16
+    if precision == "bfloat16":
+        return torch.bfloat16
+    return torch.float32
+
+
 def benchmark(
     *,
+    mem_prof_file: str,
+    mixed_precision: str,
     # benchmark
     batch_size: int = 4,
     warmup_steps: int,  # no warmup
@@ -69,7 +79,7 @@ def benchmark(
     run_optimizer: bool = True,
     # model
     vocab_size: int = 10000,
-    context_length: int = 512,
+    context_length: int,
     d_model: int,
     d_ff: int,
     num_layers: int,
@@ -86,75 +96,64 @@ def benchmark(
     # weight_decay: float = 0.01,
 ):
     device = "cuda" if torch.cuda.is_available() else "cpu"
-
     print(device)
-    # vocab_size = get_vocab_size(vocab_path)  # NOTE: keep it now
-    # print("vocab_size:", vocab_size)
-    print("Init model...")
-    model = BasicsTransformerLM(
-        vocab_size,
-        context_length,
-        d_model,
-        num_layers,
-        num_heads,
-        d_ff,
-        rope_theta,
-    )
-    model.to(device)
 
-    print("Init optimizer...")
-    optimizer = AdamW(model.parameters())  # use default values
+    dtype = get_dtype(mixed_precision)
 
-    # reuse random inputs
-    inputs, targets = get_random_batch(batch_size, vocab_size, context_length, device)
+    with torch.autocast(device, dtype=dtype):
+        # vocab_size = get_vocab_size(vocab_path)  # NOTE: keep it now
+        # print("vocab_size:", vocab_size)
+        print("Init model...")
+        model = BasicsTransformerLM(
+            vocab_size,
+            context_length,
+            d_model,
+            num_layers,
+            num_heads,
+            d_ff,
+            rope_theta,
+        ).to(device)
 
-    print("Warmup...")
-    for step in range(warmup_steps):
-        run_step(inputs, targets, step, model, optimizer, max_norm, lr_max, lr_min, t_w, t_c, run_forward, run_backward, run_optimizer)
+        print("Init optimizer...")
+        optimizer = AdamW(model.parameters())  # use default values
 
-    sync()
+        # reuse random inputs
+        inputs, targets = get_random_batch(batch_size, vocab_size, context_length, device)
 
-    # with torch.cuda.profiler.profile():
-    print("Benchmarking...")
-    forward_times = []
-    backward_times = []
-    optimizer_times = []
-    for step in range(benchmark_steps):
-        ft, bt, ot = run_step(inputs, targets, step, model, optimizer, max_norm, lr_max, lr_min, t_w, t_c, run_forward, run_backward, run_optimizer)
-        forward_times.append(ft)
-        backward_times.append(bt)
-        optimizer_times.append(ot)
+        print("Warmup...")
+        for step in range(warmup_steps):
+            run_step(inputs, targets, step, model, optimizer, max_norm, lr_max, lr_min, t_w, t_c, run_forward, run_backward, run_optimizer)
 
-    if run_forward:
-        print(f"[Forward] mean={statistics.mean(forward_times):.6f}, std={statistics.stdev(forward_times):.6f}")
-    if run_backward:
-        print(f"[Backard] mean={statistics.mean(backward_times):.6f}, std={statistics.stdev(backward_times):.6f}")
-    if run_optimizer:
-        print(f"[Optimizer] mean={statistics.mean(optimizer_times):.6f}, std={statistics.stdev(optimizer_times):.6f}")
+        sync()
 
-    print("Done")
+        # with torch.cuda.profiler.profile():
+        print("Benchmarking...")
 
+        # Start recording memory history.
+        torch.cuda.memory._record_memory_history(max_entries=1000000)
 
-class ToyModel(torch.nn.Module):
-    def __init__(self, in_features: int, out_features: int):
-        super().__init__()
-        self.fc1 = torch.nn.Linear(in_features, 10, bias=False)
-        self.ln = torch.nn.LayerNorm(10)
-        self.fc2 = torch.nn.Linear(10, out_features, bias=False)
-        self.relu = torch.nn.ReLU()
+        forward_times = []
+        backward_times = []
+        optimizer_times = []
+        for step in range(benchmark_steps):
+            ft, bt, ot = run_step(inputs, targets, step, model, optimizer, max_norm, lr_max, lr_min, t_w, t_c, run_forward, run_backward, run_optimizer)
+            forward_times.append(ft)
+            backward_times.append(bt)
+            optimizer_times.append(ot)
 
-    def forward(self, x):
-        x = self.relu(self.fc1(x))
-        x = self.ln(x)
-        x = self.fc2(x)
-        return x
+        # Save a pickle file to be loaded by PyTorch's online tool.
+        torch.cuda.memory._dump_snapshot(f"/home/wilsonhong/gdrive/cs336/{mem_prof_file}.pickle")
+        # Stop recording history.
+        torch.cuda.memory._record_memory_history(enabled=None)
 
+        if run_forward:
+            print(f"[Forward] mean={statistics.mean(forward_times):.6f}, std={statistics.stdev(forward_times):.6f}")
+        if run_backward:
+            print(f"[Backard] mean={statistics.mean(backward_times):.6f}, std={statistics.stdev(backward_times):.6f}")
+        if run_optimizer:
+            print(f"[Optimizer] mean={statistics.mean(optimizer_times):.6f}, std={statistics.stdev(optimizer_times):.6f}")
 
-def benchmark_toy():
-    toy = ToyModel()
-
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    toy.to(device)
+        print("Done")
 
 
 def main():
@@ -167,10 +166,14 @@ def main():
     parser.add_argument("--run_backward", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--run_optimizer", action=argparse.BooleanOptionalAction, default=True)
 
+    parser.add_argument("--context_length", type=int, default=512)
     parser.add_argument("--d_model", type=int, default=768)
     parser.add_argument("--d_ff", type=int, default=3072)
     parser.add_argument("--num_layers", type=int, default=12)
     parser.add_argument("--num_heads", type=int, default=12)
+
+    parser.add_argument("--mem_prof_file", type=str, default="memory_profile.pickle")
+    parser.add_argument("-mp", "--mixed_precision", type=str, default="float32", choices=["float32", "float16", "bfloat16"])
 
     args = parser.parse_args()
     # argparse gives list for nargs, train() expects tuple

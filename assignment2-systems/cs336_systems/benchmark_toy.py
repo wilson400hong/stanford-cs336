@@ -106,12 +106,12 @@ torch.autocast(dtype=torch.float16):
 
 torch.autocast(dtype=torch.bf16):
 
-• the model parameters within the autocast context ->
-• the output of the first feed-forward layer (ToyModel.fc1) -> 
-• the output of layer norm (ToyModel.ln) -> 
-• the model’s predicted logits -> 
-• the loss -> 
-• the model’s gradients -> 
+• the model parameters within the autocast context -> fp32
+• the output of the first feed-forward layer (ToyModel.fc1) -> bf16
+• the output of layer norm (ToyModel.ln) -> fp32
+• the model’s predicted logits -> bf16
+• the loss -> fp32
+• the model’s gradients -> fp32
 
 
 
