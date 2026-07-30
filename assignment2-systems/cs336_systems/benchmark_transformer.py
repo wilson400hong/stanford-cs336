@@ -10,8 +10,6 @@ from cs336_basics.model import BasicsTransformerLM
 from cs336_basics.nn_utils import cross_entropy, clip_gradient
 from cs336_basics.optimizer import AdamW, get_cosine_lr
 
-from torch.utils.checkpoint import checkpoint
-
 
 def get_random_batch(batch_size: int, vocab_size, context_length: int, device: str) -> tuple[torch.Tensor, torch.Tensor]:
     batch_tokens = [torch.randint(vocab_size, (context_length + 1,), dtype=torch.long, device=device) for _ in range(batch_size)]
@@ -184,20 +182,12 @@ def main():
     parser.add_argument("--mem_prof_file", type=str, default="memory_profile.pickle")
     parser.add_argument("-mp", "--mixed_precision", type=str, default="float32", choices=["float32", "float16", "bfloat16"])
 
-    # Activattion checkpoint
     parser.add_argument("--gradient_checkpointing", action=argparse.BooleanOptionalAction, default=False)
-    parser.add_argument("--layer_chunk_size", type=int, default=1)  # level 1
-
+    parser.add_argument("--layer_chunk_size", type=int, default=1)
     args = parser.parse_args()
-    # argparse gives list for nargs, train() expects tuple
 
     benchmark(**vars(args))
 
 
 if __name__ == "__main__":
     main()
-
-
-"""
-uv run python -m cs336_systems.benchmark --run_forward --run_backward --run_optimizer --d_model 768 --d_ff 3072 --num_layers 12 --num_heads 12 
-"""
