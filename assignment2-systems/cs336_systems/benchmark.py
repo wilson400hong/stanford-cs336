@@ -10,6 +10,8 @@ from cs336_basics.model import BasicsTransformerLM
 from cs336_basics.nn_utils import cross_entropy, clip_gradient
 from cs336_basics.optimizer import AdamW, get_cosine_lr
 
+from torch.utils.checkpoint import checkpoint
+
 
 def get_random_batch(batch_size: int, vocab_size, context_length: int, device: str) -> tuple[torch.Tensor, torch.Tensor]:
     batch_tokens = [torch.randint(vocab_size, (context_length + 1,), dtype=torch.long, device=device) for _ in range(batch_size)]
@@ -74,9 +76,12 @@ def benchmark(
     batch_size: int = 4,
     warmup_steps: int,  # no warmup
     benchmark_steps: int,
-    run_forward: bool = True,
-    run_backward: bool = True,
-    run_optimizer: bool = True,
+    run_forward: bool,
+    run_backward: bool,
+    run_optimizer: bool,
+    # graddient checkpoint
+    gradient_checkpointing: bool,
+    layer_chunk_size: int,
     # model
     vocab_size: int = 10000,
     context_length: int,
@@ -112,6 +117,8 @@ def benchmark(
             num_heads,
             d_ff,
             rope_theta,
+            gradient_checkpointing,
+            layer_chunk_size,
         ).to(device)
 
         print("Init optimizer...")
@@ -120,6 +127,8 @@ def benchmark(
         # reuse random inputs
         inputs, targets = get_random_batch(batch_size, vocab_size, context_length, device)
 
+        torch.cuda.memory._record_memory_history(max_entries=1000000)
+
         print("Warmup...")
         for step in range(warmup_steps):
             run_step(inputs, targets, step, model, optimizer, max_norm, lr_max, lr_min, t_w, t_c, run_forward, run_backward, run_optimizer)
@@ -127,10 +136,10 @@ def benchmark(
         sync()
 
         # with torch.cuda.profiler.profile():
+
         print("Benchmarking...")
 
         # Start recording memory history.
-        torch.cuda.memory._record_memory_history(max_entries=1000000)
 
         forward_times = []
         backward_times = []
@@ -159,8 +168,8 @@ def benchmark(
 def main():
     parser = argparse.ArgumentParser(description="Benchmark TransformerLM")
 
-    parser.add_argument("--warmup_steps", type=int, default=5)
-    parser.add_argument("--benchmark_steps", type=int, default=3)
+    parser.add_argument("--warmup_steps", type=int, default=3)
+    parser.add_argument("--benchmark_steps", type=int, default=6)
 
     parser.add_argument("--run_forward", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--run_backward", action=argparse.BooleanOptionalAction, default=True)
@@ -174,6 +183,10 @@ def main():
 
     parser.add_argument("--mem_prof_file", type=str, default="memory_profile.pickle")
     parser.add_argument("-mp", "--mixed_precision", type=str, default="float32", choices=["float32", "float16", "bfloat16"])
+
+    # Activattion checkpoint
+    parser.add_argument("--gradient_checkpointing", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--layer_chunk_size", type=int, default=1)  # level 1
 
     args = parser.parse_args()
     # argparse gives list for nargs, train() expects tuple
