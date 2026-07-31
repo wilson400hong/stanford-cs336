@@ -77,7 +77,7 @@ def benchmark(
 
     # print("Warmup...")
     for step in range(warmup_steps):
-        y = model.forward(x)
+        y = model(x)
         loss = y.sum()
         loss.backward()
 

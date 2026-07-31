@@ -1,12 +1,19 @@
 {
   "python.defaultInterpreterPath": "${workspaceFolder}/.venv/bin/python",
+  "python.activeInterpreterPath": "${workspaceFolder}/.venv/bin/python",
   "python.analysis.extraPaths": [
     "${workspaceFolder}/cs336-basics",
     "${workspaceFolder}/.venv/lib/python3.12/site-packages"
   ],
-  "python.pyrefly.displayTypeErrors": "default",
+  "python.autoComplete.extraPaths": [
+    "${workspaceFolder}/cs336-basics",
+    "${workspaceFolder}/.venv/lib/python3.12/site-packages"
+  ],
+  "python.pyrefly.displayTypeErrors": "force-off",
   "python.pyrefly.diagnosticMode": "openFilesOnly",
   "pyrefly.trace.server": "off",
-  "python.languageServer": "Pylance",
-  "python.experiments.enabled": false
+  "python.analysis.typeCheckingMode": "off",
+  "python.languageServer": "Default",
+  "python.experiments.enabled": false,
+  "pyls.automaticWorkspaceOverrides": false
 }

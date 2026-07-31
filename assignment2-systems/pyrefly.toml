@@ -1,0 +1,3 @@
+project_includes = ["cs336_systems/**/*", "cs336-basics/**/*", "tests/**/*"]
+search-path = [".venv/lib/python3.12/site-packages", "cs336-basics"]
+python-environment = ".venv"
