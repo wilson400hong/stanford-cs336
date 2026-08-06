@@ -7,19 +7,12 @@ import torch
 import timeit
 
 from cs336_basics.model import CausalMultiHeadSelfAttention, RotaryEmbedding
+from cs336_systems.flash_attention import FlashAttentionTriton
 
 
 """
 uv run python -m cs336_systems.benchmark_attention
 """
-
-
-def get_random_batch(batch_size: int, vocab_size, context_length: int, device: str) -> tuple[torch.Tensor, torch.Tensor]:
-    batch_tokens = [torch.randint(vocab_size, (context_length + 1,), dtype=torch.long, device=device) for _ in range(batch_size)]
-
-    x = torch.stack([tokens[:context_length] for tokens in batch_tokens])
-    y = torch.stack([tokens[1:] for tokens in batch_tokens])
-    return x, y
 
 
 def sync():
@@ -44,7 +37,7 @@ def benchmark(
     benchmark_steps: int,
     context_length: int,
     d_model: int,
-    num_heads: int,
+    num_heads: int = 1,
     torch_compile: bool,
     rope_theta: float | None = None,
 ):
@@ -129,10 +122,9 @@ def main():
     # parser.add_argument("--d_model", type=int, default=16)
     # parser.add_argument("--context_length", type=int, default=256)
     # parser.add_argument("--mem_prof_file", type=str, default="test")
-    parser.add_argument("--num_heads", type=int, default=1)
+    # parser.add_argument("--num_heads", type=int, default=1)
 
     parser.add_argument("-mp", "--mixed_precision", type=str, default="bfloat16", choices=["float32", "float16", "bfloat16"])
-
     parser.add_argument("--torch_compile", action=argparse.BooleanOptionalAction, default=False)
 
     # parser.add_argument("--gradient_checkpointing", action=argparse.BooleanOptionalAction, default=False)

@@ -3,6 +3,8 @@ import triton.language as tl
 import torch
 import math
 from einops import einsum, rearrange
+import timeit
+import statistics
 
 TILE_SIZE = 16
 
@@ -822,11 +824,6 @@ class FlashAttentionTriton(torch.autograd.Function):
         return dQ, dK, dV, None, None
 
 
-def sync():
-    if torch.cuda.is_available():
-        torch.cuda.synchronize()
-
-
 def check_pytorch(shape, is_causal, T=TILE_SIZE):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     torch.manual_seed(0)
@@ -882,7 +879,71 @@ def check_triton(shape, is_causal, tile_size=TILE_SIZE):
         print(f"  {name}: {torch.allclose(a, b, atol=1e-2, rtol=1e-2)} maxerr={(a - b).abs().max():.2e}")
 
 
-if __name__ == "__main__":
+def sync():
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+
+
+WARMUP_STEPS = 5
+BENCH_STEPS = 50
+
+
+def benchmark_attention(shape, func, warmup_steps=WARMUP_STEPS, bench_steps=BENCH_STEPS):
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    torch.manual_seed(0)
+    B, N, Dm = shape
+    is_causal = True
+
+    # Reference - PyTorch
+
+    for _ in range(WARMUP_STEPS):
+        Q = torch.rand(B, N, Dm, device=device, requires_grad=True)
+        K = torch.rand(B, N, Dm, device=device, requires_grad=True)
+        V = torch.rand(B, N, Dm, device=device, requires_grad=True)
+        dO = torch.randn(B, N, Dm, device=device)
+        O = func(Q, K, V, is_causal)
+        O.backward(dO)
+
+    fwd_times = []
+    bwd_times = []
+
+    sync()
+
+    for _ in range(BENCH_STEPS):
+        Q = torch.rand(B, N, Dm, device=device, requires_grad=True)
+        K = torch.rand(B, N, Dm, device=device, requires_grad=True)
+        V = torch.rand(B, N, Dm, device=device, requires_grad=True)
+        dO = torch.randn(B, N, Dm, device=device)
+        sync()
+
+        t0 = timeit.default_timer()
+        O = func(Q, K, V, is_causal)
+        # O = sdpa(Qr, Kr, Vr, is_causal)
+        sync()
+        t1 = timeit.default_timer()
+        fwd_times.append(t1 - t0)
+
+        O.backward(dO)
+        sync()
+        t2 = timeit.default_timer()
+        bwd_times.append(t2 - t1)
+
+    return (
+        statistics.mean(fwd_times),
+        statistics.mean(bwd_times),
+    )
+
+
+def benchmark():
+    B = 4
+    for Dm in [16, 32, 64, 128]:
+        for N in [256, 1024, 4096, 8192, 16384]:
+            pytorch_fwd, pytorch_bwd = benchmark_attention((B, N, Dm), sdpa)
+            triton_fwd, triton_bwd = benchmark_attention((B, N, Dm), FlashAttentionTriton.apply)
+            print(f"[{B=} {N=} {Dm=}] {pytorch_fwd=:.4f} {pytorch_bwd=:.4f}    {triton_fwd=:.4f}  {pytorch_bwd=:.4f}")
+
+
+def check():
     shape = [4, 1024, 256]
     for causal in [False, True]:
         print(f"# causal={causal}")
@@ -891,3 +952,7 @@ if __name__ == "__main__":
 
         print("## check Triton impl...")
         check_triton(shape, causal)
+
+
+if __name__ == "__main__":
+    benchmark()
