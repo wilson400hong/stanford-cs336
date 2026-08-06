@@ -1,13 +1,8 @@
-from sympy.codegen.cnodes import static
-from functorch import dim
-from torch.nn.modules import padding
 import triton
 import triton.language as tl
 import torch
-import timeit
 import math
 from einops import einsum, rearrange
-
 
 TILE_SIZE = 16
 
@@ -228,7 +223,7 @@ def flash_fwd_kernel(
     N_QUERIES,
     N_KEYS,
     scale,  # 1 / sqrt(D)
-    D_MODEL: tl.constexpr,  # d_model
+    D_MODEL: tl.constexpr,
     Q_TILE_SIZE: tl.constexpr,
     K_TILE_SIZE: tl.constexpr,
     is_causal: tl.constexpr,
@@ -339,11 +334,14 @@ def flash_bwd_kernel_preproc(
     stride_db,
     stride_dq,
     N_QUERIES,
-    D_MODEL: tl.constexpr,  # d_model
+    D_MODEL: tl.constexpr,
     Q_TILE_SIZE: tl.constexpr,
 ):
+    """
+    compute torch.sum(O * dO, dim=-1, keepdim=True)
+    """
     i = tl.program_id(0)
-    batch_idx = tl.program_id(1).to(tl.int64)  # batch axis
+    batch_idx = tl.program_id(1).to(tl.int64)
 
     O_block_ptr = tl.make_block_ptr(
         O_ptr + (batch_idx) * stride_ob,
@@ -414,13 +412,13 @@ def flash_bwd_kernel_dkdv(
     N_QUERIES,
     N_KEYS,
     scale,  # 1 / sqrt(D)
-    D_MODEL: tl.constexpr,  # d_model
+    D_MODEL: tl.constexpr,
     Q_TILE_SIZE: tl.constexpr,
     K_TILE_SIZE: tl.constexpr,
     is_causal: tl.constexpr,
 ):
     j = tl.program_id(0)  # key_tile_index
-    batch_idx = tl.program_id(1).to(tl.int64)  # batch axis
+    batch_idx = tl.program_id(1).to(tl.int64)
 
     Q_block_ptr = tl.make_block_ptr(
         Q_ptr + (batch_idx) * stride_qb,
@@ -560,13 +558,13 @@ def flash_bwd_kernel_dq(
     N_QUERIES,
     N_KEYS,
     scale,  # 1 / sqrt(D)
-    D_MODEL: tl.constexpr,  # d_model
+    D_MODEL: tl.constexpr,
     Q_TILE_SIZE: tl.constexpr,
     K_TILE_SIZE: tl.constexpr,
     is_causal: tl.constexpr,
 ):
     i = tl.program_id(0)  # query_tile_index
-    batch_idx = tl.program_id(1).to(tl.int64)  # batch axis
+    batch_idx = tl.program_id(1).to(tl.int64)
 
     Q_block_ptr = tl.make_block_ptr(
         Q_ptr + (batch_idx) * stride_qb,
@@ -719,8 +717,6 @@ class FlashAttentionTriton(torch.autograd.Function):
         L, Q, K, V, O = ctx.saved_tensors
         B, N, D_MODEL = Q.shape
         device = Q.device
-        is_causal = ctx.is_causal
-        tile_size = ctx.tile_size
         scale = 1.0 / math.sqrt(D_MODEL)
 
         D = torch.empty((B, N), dtype=torch.float32, device=device)
@@ -733,7 +729,7 @@ class FlashAttentionTriton(torch.autograd.Function):
             O.stride(1),
             O.stride(2),
             dO.stride(0),
-            dO.stridee(1),
+            dO.stride(1),
             dO.stride(2),
             D.stride(0),
             D.stride(1),
@@ -887,22 +883,11 @@ def check_triton(shape, is_causal, tile_size=TILE_SIZE):
 
 
 if __name__ == "__main__":
+    shape = [4, 1024, 256]
     for causal in [False, True]:
-        print(f"### causal={causal}")
-        # check_pytorch([4, 1024, 256], causal)
-        check_triton([4, 1024, 256], causal)
+        print(f"# causal={causal}")
+        print("##  check PyTorch impl...")
+        check_pytorch(shape, causal)
 
-
-# # reference from pure PyTorch autograd
-# xr = x.detach().clone().requires_grad_()
-# wr = w.detach().clone().requires_grad_()
-# (xr * wr).sum(-1).pow(2).sum().backward()
-
-# gx = torch.allclose(x.grad, xr.grad, atol=1e-2, rtol=1e-2)
-# gw = torch.allclose(w.grad, wr.grad, atol=1e-2, rtol=1e-2)
-# print(f"{str(shape):14s}  grad_x={gx}  grad_w={gw}")
-# assert gx and gw
-
-
-# for shape in [(64, 128), (70, 300), (1024, 8192)]:  # incl. non-mult rows, non-pow2 D
-#     check(shape)
+        print("## check Triton impl...")
+        check_triton(shape, causal)
