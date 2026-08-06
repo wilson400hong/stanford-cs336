@@ -6,7 +6,7 @@ from einops import einsum, rearrange
 import timeit
 import statistics
 
-TILE_SIZE = 32
+TILE_SIZE = 16
 
 
 def softmax(x, dim=-1):
