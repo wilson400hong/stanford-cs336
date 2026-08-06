@@ -1,3 +1,5 @@
+from functorch import dim
+from torch.nn.modules import padding
 import triton
 import triton.language as tl
 import torch
@@ -46,7 +48,7 @@ class FlashAttentionPytorch(torch.autograd.Function):
         """
         device = Q.device
         B, seq_len, d_model = Q.shape
-        assert seq_len % T == 0, "seq_len must be divisible by tile_size"
+        assert seq_len % T == 0, "seq_len must be divisible by T"
 
         sqrt_d = math.sqrt(d_model)
 
@@ -55,7 +57,7 @@ class FlashAttentionPytorch(torch.autograd.Function):
 
         # outer loop: Query tiling
         for i in range(0, seq_len, T):
-            # Q_i shape: (B, tile_size, D)
+            # Q_i shape: (B, T, D)
             Q_i = Q[:, i : i + T, :]
 
             # each tile has B in first dim
@@ -104,7 +106,7 @@ class FlashAttentionPytorch(torch.autograd.Function):
             L_tiles.append(L_i)
 
         O = torch.cat(O_tiles, dim=1)  # (B, N, D)
-        L = torch.cat(L_tiles, dim=1)  # (B, N, 1)
+        L = torch.cat(L_tiles, dim=1).squeeze(-1)  # (B, N)
 
         ctx.save_for_backward(L, Q, K, V, O)
         ctx.is_causal = is_causal
@@ -121,8 +123,6 @@ class FlashAttentionPytorch(torch.autograd.Function):
         sqrt_d = math.sqrt(d_model)
         is_causal = ctx.is_causal
         T = ctx.tile_size
-
-        # TODO: is_causal!!!
 
         D = torch.sum(O * dO, dim=-1, keepdim=True)
 
@@ -143,7 +143,7 @@ class FlashAttentionPytorch(torch.autograd.Function):
                 Q_i = Q[:, i : i + T, :]
                 D_i = D[:, i : i + T, :]
                 dO_i = dO[:, i : i + T, :]
-                L_i = L[:, i : i + T, :]
+                L_i = L[:, i : i + T].unsqueeze(-1)
                 dO_i = dO[:, i : i + T, :]
                 S_ij = Q_i @ K_j.mT / sqrt_d
 
@@ -170,7 +170,7 @@ class FlashAttentionPytorch(torch.autograd.Function):
         for i in range(0, seq_len, T):
             Q_i = Q[:, i : i + T, :]
             dO_i = dO[:, i : i + T, :]
-            L_i = L[:, i : i + T, :]
+            L_i = L[:, i : i + T].unsqueeze(-1)
             D_i = D[:, i : i + T, :]
 
             dQ_i = torch.zeros_like(Q_i)
@@ -201,6 +201,204 @@ class FlashAttentionPytorch(torch.autograd.Function):
         dV = torch.cat(dV_tiles, dim=1)
 
         return dQ, dK, dV, None, None
+
+
+@triton.jit
+def flash_fwd_kernel(
+    Q_ptr,
+    K_ptr,
+    V_ptr,
+    O_ptr,  # output
+    L_ptr,  # log sum exp
+    stride_qb,
+    stride_qq,
+    stride_qd,  # (batch, seq_len, d_model)
+    stride_kb,
+    stride_kk,
+    stride_kd,
+    stride_vb,
+    stride_vk,
+    stride_vd,
+    stride_ob,
+    stride_oq,
+    stride_od,
+    stride_lb,
+    stride_lq,
+    N_QUERIES,
+    N_KEYS,
+    scale,  # 1 / sqrt(D)
+    D: tl.constexpr,  # d_model
+    Q_TILE_SIZE: tl.constexpr,
+    K_TILE_SIZE: tl.constexpr,
+    is_causal: tl.constexpr,  # TODO?
+):
+    query_tile_idx = tl.program_id(0)
+    batch_idx = tl.program_id(1).to(tl.int64)  # batch axis
+
+    # sqrt_d = D**0.5
+
+    Q_block_ptr = tl.make_block_ptr(
+        Q_ptr + (batch_idx) * stride_qb,
+        shape=(N_QUERIES, D),
+        strides=(stride_qq, stride_qd),
+        offsets=(query_tile_idx * Q_TILE_SIZE, 0),
+        block_shape=(Q_TILE_SIZE, D),
+        order=(1, 0),
+    )
+
+    K_block_ptr = tl.make_block_ptr(
+        K_ptr + (batch_idx) * stride_kb,
+        shape=(N_KEYS, D),
+        strides=(stride_kk, stride_kd),
+        offsets=(0, 0),  # watch out!
+        block_shape=(K_TILE_SIZE, D),
+        order=(1, 0),
+    )
+
+    V_block_ptr = tl.make_block_ptr(
+        V_ptr + (batch_idx) * stride_vb,
+        shape=(N_KEYS, D),
+        strides=(stride_vk, stride_vd),
+        offsets=(0, 0),  # watch out!
+        block_shape=(K_TILE_SIZE, D),
+        order=(1, 0),
+    )
+
+    L_block_ptr = tl.make_block_ptr(
+        L_ptr + batch_idx * stride_lb,
+        shape=(N_QUERIES,),
+        strides=(stride_lq,),
+        offsets=(query_tile_idx * Q_TILE_SIZE,),
+        block_shape=(Q_TILE_SIZE,),
+        order=(0,),
+    )
+
+    O_block_ptr = tl.make_block_ptr(
+        O_ptr + (batch_idx) * stride_ob,
+        shape=(N_QUERIES, D),
+        strides=(stride_oq, stride_od),
+        offsets=(query_tile_idx * Q_TILE_SIZE, 0),
+        block_shape=(Q_TILE_SIZE, D),
+        order=(1, 0),
+    )
+
+    Q_i = tl.load(Q_block_ptr, boundary_check=(0, 1), padding_option="zero")
+    O_i = tl.zeros((Q_TILE_SIZE, D), dtype=tl.float32)
+    l_i = tl.zeros((Q_TILE_SIZE, 1), dtype=tl.float32)  # (T, 1)
+    m_i = tl.full((Q_TILE_SIZE, 1), float("-inf"), dtype=tl.float32)  # (T, 1)
+
+    if is_causal:
+        max_q = query_tile_idx * Q_TILE_SIZE + (Q_TILE_SIZE - 1)
+        n_kv = tl.cdiv(max_q + 1, K_TILE_SIZE)
+    else:
+        n_kv = tl.cdiv(N_KEYS, K_TILE_SIZE)
+
+    for j in range(n_kv):
+        K_j = tl.load(K_block_ptr, boundary_check=(0, 1), padding_option="zero")
+        V_j = tl.load(V_block_ptr, boundary_check=(0, 1), padding_option="zero")
+
+        S_ij = tl.dot(Q_i, tl.trans(K_j)) * scale
+
+        if is_causal:
+            q_idx = query_tile_idx * Q_TILE_SIZE + tl.arange(0, Q_TILE_SIZE)
+            k_idx = j * K_TILE_SIZE + tl.arange(0, K_TILE_SIZE)
+            causal_mask = q_idx[:, None] >= k_idx[None, :]
+            S_ij = tl.where(causal_mask, S_ij, float("-inf"))
+
+        rowmax = tl.max(S_ij, axis=-1, keep_dims=True)  # (T, 1)
+        new_m_i = tl.maximum(m_i, rowmax)  # (T, 1)
+
+        P_ij = tl.exp(S_ij - new_m_i)
+        delta_m_i = tl.exp(m_i - new_m_i)
+
+        O_i = delta_m_i * O_i + tl.dot(P_ij, V_j)
+        l_i = l_i * delta_m_i + tl.sum(P_ij, axis=-1, keep_dims=True)  # (T, 1)
+        m_i = new_m_i
+
+        K_block_ptr = K_block_ptr.advance((K_TILE_SIZE, 0))
+        V_block_ptr = V_block_ptr.advance((K_TILE_SIZE, 0))
+
+    O_i /= l_i
+
+    L_i = tl.reshape(m_i + tl.log(l_i), (Q_TILE_SIZE,))
+
+    tl.store(O_block_ptr, O_i, boundary_check=(0, 1))
+    tl.store(L_block_ptr, L_i, boundary_check=(0,))
+
+
+# def falsh_attention_triton_bwd(
+#     Q_ptr,
+#     K_ptr,
+#     V_ptr
+#     ****
+#     weight_ptr,  # original inputs
+#     grad_output_ptr,  # grad input
+#     grad_x_ptr,
+#     partial_grad_weight_ptr,  # Grad outputs
+#     stride_xr,
+#     stride_xd,
+#     stride_wd,
+#     stride_gr,
+#     stride_gxr,
+#     stride_gxd,
+#     stride_gwb,
+#     stride_gwd,  # ??
+#     NUM_ROWS,
+#     D,
+#     ROWS_TILE_SIZE: tl.constexpr,
+#     D_TILE_SIZE: tl.constexpr,
+# ):
+#     pass
+
+
+class FlashAttentionTriton(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, Q, K, V, is_causal, tile_size=TILE_SIZE):
+        B, N, D = Q.shape
+        device = Q.device
+
+        O = torch.empty((B, N, D), dtype=torch.float32, device=device)
+        L = torch.empty(
+            (B, N),
+            dtype=torch.float32,
+            device=device,
+        )
+        ctx.is_causal = is_causal
+        ctx.tile_size = tile_size
+        flash_fwd_kernel[(triton.cdiv(N, tile_size), B)](
+            Q,
+            K,
+            V,
+            O,
+            L,
+            Q.stride(0),
+            Q.stride(1),
+            Q.stride(2),
+            K.stride(0),
+            K.stride(1),
+            K.stride(2),
+            V.stride(0),
+            V.stride(1),
+            V.stride(2),
+            O.stride(0),
+            O.stride(1),
+            O.stride(2),
+            L.stride(0),
+            L.stride(1),
+            N,
+            N,
+            1.0 / math.sqrt(D),
+            D,
+            ctx.tile_size,
+            ctx.tile_size,
+            ctx.is_causal,
+        )
+
+        ctx.save_for_backward(L, Q, K, V, O)
+        return O
+
+    def backward(ctx, dO):
+        raise NotImplementedError("Implement me!")
 
 
 def sync():
@@ -235,10 +433,40 @@ def check_pytorch(shape, is_causal, T=TILE_SIZE):
         print(f"  {name}: {torch.allclose(a, b, atol=1e-2, rtol=1e-2)} maxerr={(a - b).abs().max():.2e}")
 
 
+# TODO
+def check_triton(shape, is_causal, tile_size=TILE_SIZE):
+    print(f"Check Triton FA : {shape=} {is_causal=} {tile_size=}")
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    torch.manual_seed(0)
+    B, N, Dm = shape
+
+    Q = torch.rand(B, N, Dm, device=device, requires_grad=True)
+    K = torch.rand(B, N, Dm, device=device, requires_grad=True)
+    V = torch.rand(B, N, Dm, device=device, requires_grad=True)
+    dO = torch.randn(B, N, Dm, device=device)
+
+    # flash
+    Of = FlashAttentionTriton.apply(Q, K, V, is_causal, tile_size)
+    # Of.backward(dO)
+    # dQf, dKf, dVf = Q.grad.clone(), K.grad.clone(), V.grad.clone()
+
+    # reference: same inputs, fresh leaves, SAME dO
+    Qr, Kr, Vr = (t.detach().clone().requires_grad_() for t in (Q, K, V))
+    Or = sdpa(Qr, Kr, Vr, is_causal)
+    Or.backward(dO)
+
+    print(f"verify forward: {torch.allclose(Of, Or, atol=1e-2, rtol=1e-2)}")
+
+    # print("verify backward:")
+    # for name, a, b in [("dQ", dQf, Qr.grad), ("dK", dKf, Kr.grad), ("dV", dVf, Vr.grad)]:
+    #     print(f"  {name}: {torch.allclose(a, b, atol=1e-2, rtol=1e-2)} maxerr={(a - b).abs().max():.2e}")
+
+
 if __name__ == "__main__":
     for causal in [False, True]:
         print(f"### causal={causal}")
-        check_pytorch([2, 256, 64], causal)
+        # check_pytorch([4, 1024, 256], causal)
+        check_triton([4, 1024, 256], causal)
 
 
 # # reference from pure PyTorch autograd
