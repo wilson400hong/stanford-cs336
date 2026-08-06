@@ -6,7 +6,7 @@ from einops import einsum, rearrange
 import timeit
 import statistics
 
-TILE_SIZE = 16
+TILE_SIZE = 32
 
 
 def softmax(x, dim=-1):
@@ -709,6 +709,7 @@ class FlashAttentionTriton(torch.autograd.Function):
             ctx.tile_size,
             ctx.tile_size,
             ctx.is_causal,
+            num_stages=1,
         )
 
         ctx.save_for_backward(L, Q, K, V, O)
@@ -738,6 +739,7 @@ class FlashAttentionTriton(torch.autograd.Function):
             N,
             D_MODEL,
             ctx.tile_size,
+            num_stages=1,
         )
 
         dK = torch.empty((B, N, D_MODEL), dtype=torch.float32, device=device)
@@ -781,6 +783,7 @@ class FlashAttentionTriton(torch.autograd.Function):
             ctx.tile_size,
             ctx.tile_size,
             ctx.is_causal,
+            num_stages=1,
         )
 
         dQ = torch.empty((B, N, D_MODEL), dtype=torch.float32, device=device)
@@ -819,6 +822,7 @@ class FlashAttentionTriton(torch.autograd.Function):
             ctx.tile_size,
             ctx.tile_size,
             ctx.is_causal,
+            num_stages=1,
         )
 
         return dQ, dK, dV, None, None
@@ -946,6 +950,7 @@ def benchmark_attention(shape, func, warmup_steps=WARMUP_STEPS, bench_steps=BENC
 
 def benchmark():
     B = 1
+    print(f"{TILE_SIZE=}")
     for Dm in [256, 512]:
         for N in [256, 1024, 4096, 8192, 16384, 32768]:
             pytorch_fwd, pytorch_bwd, pytorch_mem = benchmark_attention((B, N, Dm), sdpa)

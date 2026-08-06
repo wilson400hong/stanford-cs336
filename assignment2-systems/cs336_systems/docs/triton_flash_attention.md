@@ -72,3 +72,32 @@ Consequences:
 - **Test the cases that break assumptions:** `Q_TILE != K_TILE` (both directions), `N` not a multiple of the tile (boundary_check path), and **both** causal settings. These caught the diagonal-shortcut and `s_q` bugs that equal-tile tests missed.
 - **Verify each kernel in isolation** before wiring the `autograd.Function` — launch the raw kernel with reference `L`/`D` and compare to autograd grads.
 - **`autograd.Function` plumbing:** `@staticmethod` on both `forward`/`backward`; `save_for_backward` the exact tensors the test expects (and the right ones — `O` not a duplicate `Q`); return one grad per forward input (`None` for non-tensors like `is_causal`, `tile_size`).
+
+## Benchmark: Triton flash vs naive PyTorch attention
+
+Setup: `B=1`, `TILE_SIZE=16`, causal, forward + backward timed separately (warm-up 5, mean of 50), peak = `max_memory_allocated`. Baseline is the **naive** `sdpa` (materialized scores), *not* `F.scaled_dot_product_attention`.
+
+| Dm | N | fwd pt | fwd tri | fwd× | bwd pt | bwd tri | bwd× | mem pt | mem tri | mem× |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 256 | 4096 | 0.7ms | 0.4ms | 1.8× | 1.2ms | 1.5ms | 0.8× | 0.46 GB | 0.07 GB | 6.9× |
+| 256 | 8192 | 2.3ms | 1.0ms | 2.3× | 4.2ms | 4.9ms | 0.9× | 1.75 GB | 0.12 GB | 14.8× |
+| 256 | 16384 | 8.4ms | 3.2ms | 2.6× | 15.6ms | 18.5ms | 0.8× | 6.83 GB | 0.22 GB | 31.3× |
+| 256 | 32768 | 31.8ms | 11.3ms | 2.8× | 61.9ms | 68.7ms | 0.9× | 27.06 GB | 0.42 GB | **64.5×** |
+| 512 | 4096 | 1.0ms | 0.7ms | 1.4× | 1.8ms | 3.0ms | 0.6× | 0.49 GB | 0.12 GB | 4.1× |
+| 512 | 8192 | 3.3ms | 1.9ms | 1.7× | 6.3ms | 10.6ms | 0.6× | 1.80 GB | 0.22 GB | 8.2× |
+| 512 | 16384 | 12.2ms | 6.4ms | 1.9× | 23.7ms | 41.8ms | 0.6× | 6.93 GB | 0.42 GB | 16.5× |
+| 512 | 32768 | 47.8ms | 23.4ms | 2.0× | 93.6ms | 169.9ms | 0.6× | 27.26 GB | 0.82 GB | **33.1×** |
+
+(Small N=256/1024 rows omitted — overhead-bound ~0.5 ms floor, ratios not meaningful.)
+
+### Observations on the gain
+
+- **Memory is the headline win — linear vs quadratic.** Naive peak scales `∝ N²` (each doubling of `N` ≈ 4× memory: 0.46 → 1.75 → 6.83 → 27 GB). Triton scales `∝ N` (≈ 2×: 0.07 → 0.12 → 0.22 → 0.42 GB). At `N=32768` Triton uses **33–65× less memory**, and naive would OOM not much beyond this on a normal GPU while Triton keeps scaling. This — not raw speed — is the point of FlashAttention: it never materializes the `O(N²)` score matrix.
+- **Forward is 1.4–2.8× faster**, and the speedup *grows* with `N` (more of the naive cost is `O(N²)` memory traffic that flash avoids). The win is *smaller at larger `Dm`* (2.8× at Dm=256 vs 2.0× at Dm=512) because bigger head dim shifts the work toward compute, where flash's memory-traffic advantage matters less.
+- **Backward is *slower* in Triton (0.6–0.9×)** — the flash tradeoff. Flash **recomputes** `S`/`P` in the backward (to avoid storing them), spending extra FLOPs across 3 kernel launches, whereas naive keeps the whole graph materialized and does a recompute-free backward. So flash **trades backward time for memory**: at Dm=512 the backward is ~1.7× slower but uses ~30× less memory. (The kernel is also untuned — no `@triton.autotune` — so some of the backward gap is recoverable.)
+- **Net:** flash buys you (1) drastically lower memory → the ability to run long sequences at all, and (2) a faster forward; the backward pays a modest, expected recompute cost for the memory saving. Wall-clock speedup alone understates the value — the memory column is the real story.
+
+### To push further
+- **`@triton.autotune`** over `(Q_TILE, K_TILE, num_warps, num_stages)` — biggest lever, especially for the backward.
+- Calibrate against **`F.scaled_dot_product_attention`** (production flash) to see the remaining gap.
+- Larger `Dm` + longer `N` to probe the compute-bound regime.
