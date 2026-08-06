@@ -909,38 +909,48 @@ def benchmark_attention(shape, func, warmup_steps=WARMUP_STEPS, bench_steps=BENC
 
     sync()
 
-    for _ in range(BENCH_STEPS):
-        Q = torch.rand(B, N, Dm, device=device, requires_grad=True)
-        K = torch.rand(B, N, Dm, device=device, requires_grad=True)
-        V = torch.rand(B, N, Dm, device=device, requires_grad=True)
-        dO = torch.randn(B, N, Dm, device=device)
-        sync()
+    torch.cuda.empty_cache()
+    torch.cuda.reset_peak_memory_stats()  # <-- reset BEFORE the region
 
-        t0 = timeit.default_timer()
-        O = func(Q, K, V, is_causal)
-        # O = sdpa(Qr, Kr, Vr, is_causal)
-        sync()
-        t1 = timeit.default_timer()
-        fwd_times.append(t1 - t0)
+    peak = 0
+    try:
+        for _ in range(BENCH_STEPS):
+            Q = torch.rand(B, N, Dm, device=device, requires_grad=True)
+            K = torch.rand(B, N, Dm, device=device, requires_grad=True)
+            V = torch.rand(B, N, Dm, device=device, requires_grad=True)
+            dO = torch.randn(B, N, Dm, device=device)
+            sync()
 
-        O.backward(dO)
-        sync()
-        t2 = timeit.default_timer()
-        bwd_times.append(t2 - t1)
+            t0 = timeit.default_timer()
+            O = func(Q, K, V, is_causal)
+            # O = sdpa(Qr, Kr, Vr, is_causal)
+            sync()
+            t1 = timeit.default_timer()
+            fwd_times.append(t1 - t0)
 
+            O.backward(dO)
+            sync()
+            t2 = timeit.default_timer()
+            bwd_times.append(t2 - t1)
+            peak = max(peak, torch.cuda.max_memory_allocated())
+    except torch.cuda.OutOfMemoryError:
+        peak = float("nan")
+
+    torch.cuda.empty_cache()
     return (
         statistics.mean(fwd_times),
         statistics.mean(bwd_times),
+        peak,
     )
 
 
 def benchmark():
-    B = 4
-    for Dm in [16, 32, 64, 128]:
-        for N in [256, 1024, 4096, 8192, 16384]:
-            pytorch_fwd, pytorch_bwd = benchmark_attention((B, N, Dm), sdpa)
-            triton_fwd, triton_bwd = benchmark_attention((B, N, Dm), FlashAttentionTriton.apply)
-            print(f"[{B=} {N=} {Dm=}] {pytorch_fwd=:.4f} {pytorch_bwd=:.4f}    {triton_fwd=:.4f}  {pytorch_bwd=:.4f}")
+    B = 1
+    for Dm in [256, 512]:
+        for N in [256, 1024, 4096, 8192, 16384, 32768]:
+            pytorch_fwd, pytorch_bwd, pytorch_mem = benchmark_attention((B, N, Dm), sdpa)
+            triton_fwd, triton_bwd, triton_mem = benchmark_attention((B, N, Dm), FlashAttentionTriton.apply)
+            print(f"[{B=} {N=} {Dm=}] {pytorch_fwd=:.4f} {pytorch_bwd=:.4f} {pytorch_mem=}    {triton_fwd=:.4f} {triton_bwd=:.4f} {triton_mem:.4f}")
 
 
 def check():
