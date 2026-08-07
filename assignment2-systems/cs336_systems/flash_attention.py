@@ -906,8 +906,8 @@ def benchmark_attention(shape, func, warmup_steps=WARMUP_STEPS, bench_steps=BENC
             dO = torch.randn(B, N, Dm, dtype=dtype, device=device)
             O = func(Q, K, V, is_causal)
             O.backward(dO)
-    except:
-        return None, None, None
+    except torch.cuda.OutOfMemoryError:
+        return 0.0, 0.0, float("-inf")
 
     fwd_times = []
     bwd_times = []
@@ -939,7 +939,7 @@ def benchmark_attention(shape, func, warmup_steps=WARMUP_STEPS, bench_steps=BENC
             bwd_times.append(t2 - t1)
             peak = max(peak, torch.cuda.max_memory_allocated())
     except torch.cuda.OutOfMemoryError:
-        peak = None
+        peak = float("-inf")
 
     torch.cuda.empty_cache()
     return (

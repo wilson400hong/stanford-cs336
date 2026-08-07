@@ -166,8 +166,8 @@ def benchmark(
 def main():
     parser = argparse.ArgumentParser(description="Benchmark TransformerLM")
 
-    parser.add_argument("--warmup_steps", type=int, default=3)
-    parser.add_argument("--benchmark_steps", type=int, default=6)
+    parser.add_argument("--warmup_steps", type=int, default=5)
+    parser.add_argument("--benchmark_steps", type=int, default=20)
 
     parser.add_argument("--run_forward", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--run_backward", action=argparse.BooleanOptionalAction, default=True)

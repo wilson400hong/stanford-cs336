@@ -116,8 +116,8 @@ def benchmark(
 def main():
     parser = argparse.ArgumentParser(description="Benchmark TransformerLM")
 
-    parser.add_argument("--warmup_steps", type=int, default=10)
-    parser.add_argument("--benchmark_steps", type=int, default=100)
+    parser.add_argument("--warmup_steps", type=int, default=5)
+    parser.add_argument("--benchmark_steps", type=int, default=20)
 
     # parser.add_argument("--d_model", type=int, default=16)
     # parser.add_argument("--context_length", type=int, default=256)
