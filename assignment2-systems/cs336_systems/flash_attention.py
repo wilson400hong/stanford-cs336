@@ -8,6 +8,8 @@ import statistics
 
 TILE_SIZE = 16
 
+DTYPE = torch.bfloat16
+
 
 def softmax(x, dim=-1):
     rescaled = torch.exp(x - torch.max(x, dim=dim, keepdim=True)[0])
@@ -59,7 +61,7 @@ class FlashAttentionPytorch(torch.autograd.Function):
             Q_i = Q[:, i : i + T, :]
 
             # each tile has B in first dim
-            O_i = torch.zeros((B, T, d_model), dtype=torch.float32, device=device)
+            O_i = torch.zeros((B, T, d_model), dtype=Q.dtype, device=device)
             l_i = torch.zeros((B, T, 1), dtype=torch.float32, device=device)
             m_i = torch.full((B, T, 1), float("-inf"), dtype=torch.float32, device=device)
 
@@ -307,7 +309,7 @@ def flash_fwd_kernel(
         P_ij = tl.exp(S_ij - new_m_i)
         delta_m_i = tl.exp(m_i - new_m_i)
 
-        O_i = delta_m_i * O_i + tl.dot(P_ij, V_j)
+        O_i = delta_m_i * O_i + tl.dot(P_ij.to(V_j.dtype), V_j)
         l_i = l_i * delta_m_i + tl.sum(P_ij, axis=-1, keep_dims=True)  # (T, 1)
         m_i = new_m_i
 
@@ -318,7 +320,7 @@ def flash_fwd_kernel(
 
     L_i = tl.reshape(m_i + tl.log(l_i), (Q_TILE_SIZE,))
 
-    tl.store(O_block_ptr, O_i, boundary_check=(0, 1))
+    tl.store(O_block_ptr, O_i.to(Q_i.dtype), boundary_check=(0, 1))
     tl.store(L_block_ptr, L_i, boundary_check=(0,))
 
 
@@ -374,7 +376,7 @@ def flash_bwd_kernel_preproc(
 
     O_i = tl.load(O_block_ptr, boundary_check=(0, 1), padding_option="zero")
     dO_i = tl.load(dO_block_ptr, boundary_check=(0, 1), padding_option="zero")
-    D_i = tl.sum(O_i * dO_i, axis=1)
+    D_i = tl.sum(O_i.to(tl.float32) * dO_i.to(tl.float32), axis=1)
 
     tl.store(D_block_ptr, D_i, boundary_check=(0,))
 
@@ -515,18 +517,18 @@ def flash_bwd_kernel_dkdv(
 
         P_ij = tl.exp(S_ij - L_i)
 
-        dV_j += tl.dot(tl.trans(P_ij), dO_i)
+        dV_j += tl.dot(tl.trans(P_ij.to(dO_i.dtype)), dO_i)
         dP_ij = tl.dot(dO_i, tl.trans(V_j))
         dS_ij = P_ij * (dP_ij - D_i)
-        dK_j += scale * tl.dot(tl.trans(dS_ij), Q_i)
+        dK_j += scale * tl.dot(tl.trans(dS_ij).to(Q_i.dtype), Q_i)
 
         Q_block_ptr = Q_block_ptr.advance((Q_TILE_SIZE, 0))
         dO_block_ptr = dO_block_ptr.advance((Q_TILE_SIZE, 0))
         L_block_ptr = L_block_ptr.advance((Q_TILE_SIZE,))
         D_block_ptr = D_block_ptr.advance((Q_TILE_SIZE,))
 
-    tl.store(dV_block_ptr, dV_j, boundary_check=(0, 1))
-    tl.store(dK_block_ptr, dK_j, boundary_check=(0, 1))
+    tl.store(dV_block_ptr, dV_j.to(V_j.dtype), boundary_check=(0, 1))
+    tl.store(dK_block_ptr, dK_j.to(K_j.dtype), boundary_check=(0, 1))
 
 
 @triton.jit
@@ -660,12 +662,12 @@ def flash_bwd_kernel_dq(
         dP_ij = tl.dot(dO_i, tl.trans(V_j))
         dS_ij = P_ij * (dP_ij - D_i)
 
-        dQ_i += scale * tl.dot(dS_ij, K_j)
+        dQ_i += scale * tl.dot(dS_ij.to(K_j.dtype), K_j)
 
         K_block_ptr = K_block_ptr.advance((K_TILE_SIZE, 0))
         V_block_ptr = V_block_ptr.advance((K_TILE_SIZE, 0))
 
-    tl.store(dQ_block_ptr, dQ_i, boundary_check=(0, 1))
+    tl.store(dQ_block_ptr, dQ_i.to(Q_i.dtype), boundary_check=(0, 1))
 
 
 class FlashAttentionTriton(torch.autograd.Function):
@@ -674,10 +676,10 @@ class FlashAttentionTriton(torch.autograd.Function):
         B, N, D_MODEL = Q.shape
         device = Q.device
         scale = 1.0 / math.sqrt(D_MODEL)
-        O = torch.empty((B, N, D_MODEL), dtype=torch.float32, device=device)
+        O = torch.empty_like(Q)
         L = torch.empty(
             (B, N),
-            dtype=torch.float32,
+            dtype=torch.float32,  # TODO
             device=device,
         )
         ctx.is_causal = is_causal
@@ -709,7 +711,6 @@ class FlashAttentionTriton(torch.autograd.Function):
             ctx.tile_size,
             ctx.tile_size,
             ctx.is_causal,
-            num_stages=1,
         )
 
         ctx.save_for_backward(L, Q, K, V, O)
@@ -739,11 +740,10 @@ class FlashAttentionTriton(torch.autograd.Function):
             N,
             D_MODEL,
             ctx.tile_size,
-            num_stages=1,
         )
 
-        dK = torch.empty((B, N, D_MODEL), dtype=torch.float32, device=device)
-        dV = torch.empty((B, N, D_MODEL), dtype=torch.float32, device=device)
+        dK = torch.empty_like(K)
+        dV = torch.empty_like(V)
 
         flash_bwd_kernel_dkdv[(triton.cdiv(N, ctx.tile_size), B)](
             Q,
@@ -783,11 +783,9 @@ class FlashAttentionTriton(torch.autograd.Function):
             ctx.tile_size,
             ctx.tile_size,
             ctx.is_causal,
-            num_stages=1,
         )
 
-        dQ = torch.empty((B, N, D_MODEL), dtype=torch.float32, device=device)
-
+        dQ = torch.empty_like(Q)
         flash_bwd_kernel_dq[(triton.cdiv(N, ctx.tile_size), B)](
             Q,
             K,
@@ -822,7 +820,6 @@ class FlashAttentionTriton(torch.autograd.Function):
             ctx.tile_size,
             ctx.tile_size,
             ctx.is_causal,
-            num_stages=1,
         )
 
         return dQ, dK, dV, None, None
@@ -830,13 +827,14 @@ class FlashAttentionTriton(torch.autograd.Function):
 
 def check_pytorch(shape, is_causal, T=TILE_SIZE):
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    dtype = DTYPE
     torch.manual_seed(0)
     B, N, Dm = shape
 
-    Q = torch.rand(B, N, Dm, device=device, requires_grad=True)
-    K = torch.rand(B, N, Dm, device=device, requires_grad=True)
-    V = torch.rand(B, N, Dm, device=device, requires_grad=True)
-    dO = torch.randn(B, N, Dm, device=device)
+    Q = torch.rand(B, N, Dm, dtype=dtype, device=device, requires_grad=True)
+    K = torch.rand(B, N, Dm, dtype=dtype, device=device, requires_grad=True)
+    V = torch.rand(B, N, Dm, dtype=dtype, device=device, requires_grad=True)
+    dO = torch.randn(B, N, Dm, dtype=dtype, device=device)
 
     # flash
     Of = FlashAttentionPytorch.apply(Q, K, V, is_causal, T)
@@ -858,13 +856,14 @@ def check_pytorch(shape, is_causal, T=TILE_SIZE):
 def check_triton(shape, is_causal, tile_size=TILE_SIZE):
     print(f"Check Triton FA : {shape=} {is_causal=} {tile_size=}")
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    dtype = DTYPE
     torch.manual_seed(0)
     B, N, Dm = shape
 
-    Q = torch.rand(B, N, Dm, device=device, requires_grad=True)
-    K = torch.rand(B, N, Dm, device=device, requires_grad=True)
-    V = torch.rand(B, N, Dm, device=device, requires_grad=True)
-    dO = torch.randn(B, N, Dm, device=device)
+    Q = torch.rand(B, N, Dm, dtype=dtype, device=device, requires_grad=True)
+    K = torch.rand(B, N, Dm, dtype=dtype, device=device, requires_grad=True)
+    V = torch.rand(B, N, Dm, dtype=dtype, device=device, requires_grad=True)
+    dO = torch.randn(B, N, Dm, dtype=dtype, device=device)
 
     # flash
     Of = FlashAttentionTriton.apply(Q, K, V, is_causal, tile_size)
@@ -894,17 +893,16 @@ BENCH_STEPS = 50
 
 def benchmark_attention(shape, func, warmup_steps=WARMUP_STEPS, bench_steps=BENCH_STEPS):
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    dtype = DTYPE
     torch.manual_seed(0)
     B, N, Dm = shape
     is_causal = True
 
-    # Reference - PyTorch
-
     for _ in range(WARMUP_STEPS):
-        Q = torch.rand(B, N, Dm, device=device, requires_grad=True)
-        K = torch.rand(B, N, Dm, device=device, requires_grad=True)
-        V = torch.rand(B, N, Dm, device=device, requires_grad=True)
-        dO = torch.randn(B, N, Dm, device=device)
+        Q = torch.rand(B, N, Dm, dtype=dtype, device=device, requires_grad=True)
+        K = torch.rand(B, N, Dm, dtype=dtype, device=device, requires_grad=True)
+        V = torch.rand(B, N, Dm, dtype=dtype, device=device, requires_grad=True)
+        dO = torch.randn(B, N, Dm, dtype=dtype, device=device)
         O = func(Q, K, V, is_causal)
         O.backward(dO)
 
@@ -919,10 +917,10 @@ def benchmark_attention(shape, func, warmup_steps=WARMUP_STEPS, bench_steps=BENC
     peak = 0
     try:
         for _ in range(BENCH_STEPS):
-            Q = torch.rand(B, N, Dm, device=device, requires_grad=True)
-            K = torch.rand(B, N, Dm, device=device, requires_grad=True)
-            V = torch.rand(B, N, Dm, device=device, requires_grad=True)
-            dO = torch.randn(B, N, Dm, device=device)
+            Q = torch.rand(B, N, Dm, dtype=dtype, device=device, requires_grad=True)
+            K = torch.rand(B, N, Dm, dtype=dtype, device=device, requires_grad=True)
+            V = torch.rand(B, N, Dm, dtype=dtype, device=device, requires_grad=True)
+            dO = torch.randn(B, N, Dm, dtype=dtype, device=device)
             sync()
 
             t0 = timeit.default_timer()
@@ -949,10 +947,10 @@ def benchmark_attention(shape, func, warmup_steps=WARMUP_STEPS, bench_steps=BENC
 
 
 def benchmark():
-    B = 1
+    B = 8
     print(f"{TILE_SIZE=}")
-    for Dm in [256, 512]:
-        for N in [256, 1024, 4096, 8192, 16384, 32768]:
+    for Dm in [64]:
+        for N in [2048, 8192, 32768, 65536]:
             pytorch_fwd, pytorch_bwd, pytorch_mem = benchmark_attention((B, N, Dm), sdpa)
             triton_fwd, triton_bwd, triton_mem = benchmark_attention((B, N, Dm), FlashAttentionTriton.apply)
             print(f"[{B=} {N=} {Dm=}] {pytorch_fwd=:.4f} {pytorch_bwd=:.4f} {pytorch_mem=}    {triton_fwd=:.4f} {triton_bwd=:.4f} {triton_mem:.4f}")
