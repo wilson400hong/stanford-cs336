@@ -744,6 +744,7 @@ class FlashAttentionTriton(torch.autograd.Function):
 
         dK = torch.empty_like(K)
         dV = torch.empty_like(V)
+        dQ = torch.empty_like(Q)
 
         flash_bwd_kernel_dkdv[(triton.cdiv(N, ctx.tile_size), B)](
             Q,
@@ -785,7 +786,6 @@ class FlashAttentionTriton(torch.autograd.Function):
             ctx.is_causal,
         )
 
-        dQ = torch.empty_like(Q)
         flash_bwd_kernel_dq[(triton.cdiv(N, ctx.tile_size), B)](
             Q,
             K,
@@ -898,13 +898,16 @@ def benchmark_attention(shape, func, warmup_steps=WARMUP_STEPS, bench_steps=BENC
     B, N, Dm = shape
     is_causal = True
 
-    for _ in range(WARMUP_STEPS):
-        Q = torch.rand(B, N, Dm, dtype=dtype, device=device, requires_grad=True)
-        K = torch.rand(B, N, Dm, dtype=dtype, device=device, requires_grad=True)
-        V = torch.rand(B, N, Dm, dtype=dtype, device=device, requires_grad=True)
-        dO = torch.randn(B, N, Dm, dtype=dtype, device=device)
-        O = func(Q, K, V, is_causal)
-        O.backward(dO)
+    try:
+        for _ in range(WARMUP_STEPS):
+            Q = torch.rand(B, N, Dm, dtype=dtype, device=device, requires_grad=True)
+            K = torch.rand(B, N, Dm, dtype=dtype, device=device, requires_grad=True)
+            V = torch.rand(B, N, Dm, dtype=dtype, device=device, requires_grad=True)
+            dO = torch.randn(B, N, Dm, dtype=dtype, device=device)
+            O = func(Q, K, V, is_causal)
+            O.backward(dO)
+    except:
+        return None, None, None
 
     fwd_times = []
     bwd_times = []
@@ -936,7 +939,7 @@ def benchmark_attention(shape, func, warmup_steps=WARMUP_STEPS, bench_steps=BENC
             bwd_times.append(t2 - t1)
             peak = max(peak, torch.cuda.max_memory_allocated())
     except torch.cuda.OutOfMemoryError:
-        peak = float("nan")
+        peak = None
 
     torch.cuda.empty_cache()
     return (
