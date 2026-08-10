@@ -121,6 +121,79 @@ earlier.
   compute, *lowering* the fraction. This is why production training uses large per-device
   batches.
 
+## Optimizer state sharding (ZeRO-1)
+
+`cs336_systems/sharded_optimizer.py` partitions optimizer state across ranks: each rank
+builds an inner optimizer over a disjoint subset of parameter tensors, steps only that
+subset, then a single padded `all_gather` restores every rank's full parameter copy.
+Parameters and gradients stay replicated; only Adam's `m`/`v` are sharded.
+
+Measured from `_dump_snapshot` on rank 0, `world_size=4`, same model as above
+(Ψ ≈ 12.7 GiB of fp32 parameters):
+
+| | vanilla AdamW | ZeRO-1 | delta |
+|---|---|---|---|
+| **Persistent allocated** (end of run) | 50.91 GiB | 31.97 GiB | **−18.94 GiB (−37%)** |
+| Reserved (allocator pool) | 69.35 GiB | 98.33 GiB | +28.98 GiB |
+| Overall peak allocated | 66.98 GiB | 66.98 GiB | 0 |
+
+**The steady-state saving matches theory exactly.** Predicted persistent footprint is
+`4Ψ` for vanilla (params + grads + `m` + `v`) versus `2Ψ + 2Ψ/N` for ZeRO-1:
+
+```
+vanilla:  4 × 12.7                 = 50.8 GiB   (measured 50.91)
+ZeRO-1:   2 × 12.7 + 2 × 12.7 / 4  = 31.9 GiB   (measured 31.97)
+saving:   2Ψ(1 − 1/N) = 1.5Ψ       = 19.1 GiB   (measured 18.94)
+```
+
+Two independent readings agree — summing `active_allocated` blocks in the snapshot's
+`segments`, and replaying the `device_traces` allocation events to the end of the run.
+
+### But peak memory did not improve
+
+This is the part worth understanding, and it has two separate causes.
+
+**1. The overall peak is set before any optimizer state exists.** Both runs peak at
+66.98 GiB at the *same* trace event, during the first backward pass. Adam allocates `m`
+and `v` lazily on the first `step()`, so at that moment neither run has optimizer state —
+the peak is parameters + gradients + activations + DDP's flat all-reduce buffer, which
+ZeRO-1 does not touch. Nothing about sharding can lower it.
+
+**2. The sharded `step()` allocates a large per-step transient.** The ZeRO-1 trace shows
+allocation sizes absent from the vanilla trace:
+
+```
+1 × 12.88 GiB   ← DDP's flat gradient buffer (present in both)
+5 ×  3.22 GiB   ← ShardedOptimizer: local_flat (1) + gathered (4)
+```
+
+That's **16.1 GiB of transient allocation per step**, every step, to reconstitute full
+parameters via `all_gather`. It claws back most of the 18.9 GiB of steady-state saving at
+the moment of peak usage — and the repeated allocate/free churn is why *reserved* memory
+grew by 29 GiB: the caching allocator fragments and never returns blocks to the driver.
+
+**Takeaway:** ZeRO-1 as implemented reduces the memory a model *holds*, not the memory it
+*touches*. For fitting a larger model that distinction matters — peak is what OOMs you.
+Production ZeRO avoids this by reusing a preallocated flat buffer rather than allocating
+per step, and by bucketing the all-gather so only a fraction of parameters is
+materialized at once.
+
+### Communication cost
+
+ZeRO-1 adds an all-gather of all parameters (~12.7 GiB payload) every step, on top of the
+existing gradient all-reduce. This is the trade: linear reduction in optimizer-state
+memory for roughly double the per-step communication.
+
+### Caveats on these numbers
+
+- Peak figures come from replaying `device_traces`. The endpoint values match theory to
+  within 0.5%, but mid-trace running totals drift (allocation and free events do not pair
+  1:1 in the trace), so **per-step peaks in this table should be confirmed with
+  `torch.cuda.reset_peak_memory_stats()` / `max_memory_allocated()`** before being quoted.
+- Rank 0 only. Because the partition is greedy-by-`numel` over whole tensors, other ranks
+  may hold slightly different amounts; the largest rank is what determines whether the
+  job fits.
+
 ## Open items
 
 These affect how defensible the numbers above are:
@@ -139,3 +212,7 @@ These affect how defensible the numbers above are:
   or allocator pressure rather than a communication change).
 - **Overlapped step time not yet measured** — the metric that actually matters for that
   variant.
+- **Per-step peak memory** for the ZeRO-1 comparison needs `max_memory_allocated()`
+  rather than trace replay (see caveat above).
+- **ZeRO-1 step time not yet measured.** The extra all-gather should show up as a slower
+  step; the memory saving is only interesting alongside its time cost.

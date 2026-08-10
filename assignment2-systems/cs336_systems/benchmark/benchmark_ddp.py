@@ -177,7 +177,7 @@ def main():
     parser.add_argument("--world_size", type=int, default=4)
     parser.add_argument("--backend", type=str, default="nccl", choices=["nccl", "gloo"])
 
-    parser.add_argument("--mem_prof_file", type=str, default="ddp_mem_prof")
+    parser.add_argument("--mem_prof_file", type=str, default="memprof_ddp")
     parser.add_argument("--sharding", type=str, default="none", choices=["none", "zero1", "fsdp"])
     args = parser.parse_args()
 

@@ -11,6 +11,7 @@ class ShardedOptimizer(torch.optim.Optimizer):
         self,
         params: Iterable[torch.nn.parameter.Parameter],
         optimizer_cls: Type[torch.optim.Optimizer],
+        sync_mode: str = "broadcast",  # ["broadcast", "allgather"]
         **kwargs: Any,
     ):
         if not dist.is_initialized():
@@ -23,6 +24,8 @@ class ShardedOptimizer(torch.optim.Optimizer):
         self.rank_to_params = [[] for _ in range(self.world_size)]
         self.rank_sizes = [0 for _ in range(self.world_size)]
         self.max_size = 0  # max(size of rank_sizes)
+        assert sync_mode in ["broadcast", "allgather"]
+        self.sync_mode = sync_mode
 
         self.kwargs = kwargs
         super().__init__(params, kwargs)
@@ -57,9 +60,41 @@ class ShardedOptimizer(torch.optim.Optimizer):
         else:
             self.optim.add_param_group({"params": local_params})
 
-    @torch.no_grad  # CRITICAL: since we modify Tensors that requires_grad=True
+    @torch.no_grad
     def step(self, closure: Callable | None = None):
-        # sync first param group's fields to all sub optimizer
+        if self.sync_mode == "broadcast":
+            return self.step_broadcast(closure)
+        elif self.sync_mode == "allgather":
+            return self.step_allgather(closure)
+
+    # async broadcast for all params.
+    @torch.no_grad  # CRITICAL: since we modify Tensors that requires_grad=True
+    def step_broadcast(self, closure: Callable | None = None):
+        # sync param groups' fields (excluding params) to sub optimizer
+        for idx, pg in enumerate(self.param_groups):
+            for k, v in pg.items():
+                if k != "params":
+                    self.optim.param_groups[idx][k] = v
+
+        loss = self.optim.step(closure)
+
+        handles = []
+        for rank, params in enumerate(self.rank_to_params):
+            for param in params:
+                handle = dist.broadcast(param, src=rank, async_op=True)
+                handles.append(handle)
+
+        # sync
+        for handle in handles:
+            handle.wait()
+
+        return loss
+
+    # NOTE: ONE all-gather by flatten and unflatten all local params
+    # CONS: this does not save memory usage due to materializing the unflatten-padded one.
+    @torch.no_grad  # CRITICAL: since we modify Tensors that requires_grad=True
+    def step_allgather(self, closure: Callable | None = None):
+        # sync param groups' fields (excluding params) to sub optimizer
         for idx, pg in enumerate(self.param_groups):
             for k, v in pg.items():
                 if k != "params":
