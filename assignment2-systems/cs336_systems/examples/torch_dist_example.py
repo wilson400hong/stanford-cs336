@@ -11,7 +11,7 @@ def setup(rank, world_size, backend):
     os.environ["MASTER_PORT"] = "29500"
     os.environ["NCCL_DEBUG"] = "WARN"
     dist.init_process_group(backend, rank=rank, world_size=world_size)
-    if backend == "cuda":
+    if backend == "nccl":
         torch.cuda.set_device(rank)
 
 
@@ -19,7 +19,7 @@ def demo(rank, world_size, backend):
     setup(rank, world_size, backend)
 
     data = torch.randint(0, 10, (3,))
-    if backend == "cuda":
+    if backend == "nccl":
         data = data.to(f"cuda:{rank}")
 
     print(f"rank {rank} data (before all-reduce: {data})")
@@ -33,7 +33,7 @@ def benchmark(rank, world_size, data_size, backend):
     setup(rank, world_size, backend)
 
     data = torch.rand((data_size,), dtype=torch.float32)
-    if backend == "cuda":
+    if backend == "nccl":
         data = data.to(f"cuda:{rank}")
     torch.cuda.synchronize()
     # warmup

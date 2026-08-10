@@ -2,7 +2,8 @@ from typing import cast
 
 import torch
 from cs336_systems.flash_attention import FlashAttentionPytorch, FlashAttentionTriton
-from cs336_systems.ddp import DDPModule
+from cs336_systems.ddp import NaiveDDPModule, DDPModule
+from cs336_systems.sharded_optimizer import ShardedOptimizer
 
 
 def get_flashattention_autograd_function_pytorch() -> type:
@@ -51,8 +52,8 @@ def get_ddp(module: torch.nn.Module) -> torch.nn.Module:
     Returns:
         Instance of a DDP class.
     """
-    # TODO: overlap comm and backprop
-    return DDPModule(module)
+    # return NaiveDDPModule(module) # Naive
+    return DDPModule(module)  # Overlap
 
 
 def ddp_on_after_backward(ddp_model: torch.nn.Module, optimizer: torch.optim.Optimizer):
@@ -66,9 +67,8 @@ def ddp_on_after_backward(ddp_model: torch.nn.Module, optimizer: torch.optim.Opt
         optimizer: torch.optim.Optimizer
             Optimizer being used with the DDP-wrapped model.
     """
-    # TODO: overlap
-    ddp_model = cast(DDPModule, ddp_model)
-    ddp_model.sync_all_gradients()
+    # ddp_model.reduce_all_gradients()  # Naive
+    ddp_model.finish_gradient_synchronization()  # Overlap
 
 
 def get_fsdp(module: torch.nn.Module, compute_dtype: torch.dtype | None = None) -> torch.nn.Module:
@@ -135,4 +135,4 @@ def get_sharded_optimizer(params, optimizer_cls: type[torch.optim.Optimizer], **
     Returns:
         Instance of sharded optimizer.
     """
-    raise NotImplementedError
+    return ShardedOptimizer(params, optimizer_cls, **kwargs)

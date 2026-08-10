@@ -7,7 +7,6 @@ import torch
 import timeit
 
 from cs336_basics.model import CausalMultiHeadSelfAttention, RotaryEmbedding
-from cs336_systems.flash_attention import FlashAttentionTriton
 
 
 """
