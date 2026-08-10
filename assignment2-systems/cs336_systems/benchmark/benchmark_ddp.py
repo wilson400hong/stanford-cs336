@@ -1,5 +1,5 @@
 import statistics
-from cs336_systems.ddp import DDPModule, NaiveDDPModule
+
 import argparse
 import torch
 import timeit
@@ -11,9 +11,8 @@ import torch.multiprocessing as mp
 from cs336_basics.model import BasicsTransformerLM
 from cs336_basics.nn_utils import cross_entropy, clip_gradient
 from cs336_basics.optimizer import AdamW, get_cosine_lr
-
-
-# TODO: benchmark memory usage!
+from cs336_systems.ddp import DDPModule, NaiveDDPModule
+from cs336_systems.sharded_optimizer import ShardedOptimizer
 
 
 def get_random_batch(batch_size: int, vocab_size, context_length: int, device: str) -> tuple[torch.Tensor, torch.Tensor]:
@@ -88,6 +87,11 @@ def benchmark(
     rope_theta = 10000.0
     gradient_checkpointing = args.gradient_checkpointing
     layer_chunk_size = args.layer_chunk_size
+    mem_prof_file = args.mem_prof_file
+    sharding = args.sharding
+    batch_size = args.batch_size
+
+    torch.cuda.memory._record_memory_history(max_entries=1000000)
 
     print(f"[{rank}] Init model...")
     model = BasicsTransformerLM(
@@ -105,10 +109,10 @@ def benchmark(
     # model = NaiveDDPModule(model)
     model = DDPModule(model)
 
-    optimizer = AdamW(model.parameters())  # use default values
-
-    # reuse random inputs
-    batch_size = args.batch_size
+    if sharding == "zero1":
+        optimizer = ShardedOptimizer(model.parameters(), AdamW)
+    else:
+        optimizer = AdamW(model.parameters())
 
     inputs, targets = get_random_batch(batch_size, vocab_size, context_length, device)
 
@@ -123,6 +127,12 @@ def benchmark(
         run_step(device, inputs, targets, step, model, optimizer, max_norm, lr_max, lr_min, t_w, t_c)
 
     sync(device)
+
+    # Save a pickle file to be loaded by PyTorch's online tool.
+    if rank == 0:
+        torch.cuda.memory._dump_snapshot(f"/home/wilsonhong/gdrive/cs336/{mem_prof_file}_{sharding}.pickle")
+    # Stop recording history.
+    torch.cuda.memory._record_memory_history(enabled=None)
 
     print(f"[{rank}] Benchmarking...")
 
@@ -151,8 +161,8 @@ def benchmark(
 def main():
     parser = argparse.ArgumentParser(description="Benchmark TransformerLM")
 
-    parser.add_argument("--warmup_steps", type=int, default=5)
-    parser.add_argument("--benchmark_steps", type=int, default=10)
+    parser.add_argument("--warmup_steps", type=int, default=1)
+    parser.add_argument("--benchmark_steps", type=int, default=1)
 
     parser.add_argument("--context_length", type=int, default=512)
     parser.add_argument("--d_model", type=int, default=2560)
@@ -167,6 +177,8 @@ def main():
     parser.add_argument("--world_size", type=int, default=4)
     parser.add_argument("--backend", type=str, default="nccl", choices=["nccl", "gloo"])
 
+    parser.add_argument("--mem_prof_file", type=str, default="ddp_mem_prof")
+    parser.add_argument("--sharding", type=str, default="none", choices=["none", "zero1", "fsdp"])
     args = parser.parse_args()
 
     mp.spawn(
