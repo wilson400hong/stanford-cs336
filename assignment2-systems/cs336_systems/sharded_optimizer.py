@@ -62,22 +62,22 @@ class ShardedOptimizer(torch.optim.Optimizer):
 
     @torch.no_grad
     def step(self, closure: Callable | None = None):
-        if self.sync_mode == "broadcast":
-            return self.step_broadcast(closure)
-        elif self.sync_mode == "allgather":
-            return self.step_allgather(closure)
-
-    # async broadcast for all params.
-    @torch.no_grad  # CRITICAL: since we modify Tensors that requires_grad=True
-    def step_broadcast(self, closure: Callable | None = None):
         # sync param groups' fields (excluding params) to sub optimizer
         for idx, pg in enumerate(self.param_groups):
             for k, v in pg.items():
                 if k != "params":
                     self.optim.param_groups[idx][k] = v
 
-        loss = self.optim.step(closure)
+        if self.sync_mode == "broadcast":
+            return self.step_broadcast(closure)
+        elif self.sync_mode == "allgather":
+            return self.step_allgather(closure)
 
+    # async broadcast for each params.
+    # communications are overlapped, so it is fine
+    @torch.no_grad  # CRITICAL: since we modify Tensors that requires_grad=True
+    def step_broadcast(self, closure: Callable | None = None):
+        loss = self.optim.step(closure)
         handles = []
         for rank, params in enumerate(self.rank_to_params):
             for param in params:
@@ -87,19 +87,12 @@ class ShardedOptimizer(torch.optim.Optimizer):
         # sync
         for handle in handles:
             handle.wait()
-
         return loss
 
     # NOTE: ONE all-gather by flatten and unflatten all local params
     # CONS: this does not save memory usage due to materializing the unflatten-padded one.
     @torch.no_grad  # CRITICAL: since we modify Tensors that requires_grad=True
     def step_allgather(self, closure: Callable | None = None):
-        # sync param groups' fields (excluding params) to sub optimizer
-        for idx, pg in enumerate(self.param_groups):
-            for k, v in pg.items():
-                if k != "params":
-                    self.optim.param_groups[idx][k] = v
-
         loss = self.optim.step(closure)
 
         local_params = self.rank_to_params[self.rank]
@@ -116,7 +109,6 @@ class ShardedOptimizer(torch.optim.Optimizer):
             params = self.rank_to_params[rank]
             unpad_flat = pad_flat[: self.rank_sizes[rank]]
             unflat_params = torch._utils._unflatten_dense_tensors(unpad_flat, params)
-
             for p, new_p in zip(params, unflat_params):
                 p.copy_(new_p)
 
