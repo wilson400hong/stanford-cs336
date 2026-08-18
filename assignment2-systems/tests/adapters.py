@@ -3,6 +3,7 @@ from typing import cast
 import torch
 from cs336_systems.flash_attention import FlashAttentionPytorch, FlashAttentionTriton
 from cs336_systems.ddp import NaiveDDPModule, DDPModule
+from cs336_systems.fsdp import FSDPModule
 from cs336_systems.sharded_optimizer import ShardedOptimizer
 
 
@@ -87,7 +88,7 @@ def get_fsdp(module: torch.nn.Module, compute_dtype: torch.dtype | None = None) 
         Instance of an FSDP class.
     """
     # For example: return FSDP(module, compute_dtype=compute_dtype)
-    raise NotImplementedError
+    return FSDPModule(module, compute_dtype)
 
 
 def fsdp_on_after_backward(fsdp_model: torch.nn.Module, optimizer: torch.optim.Optimizer):
