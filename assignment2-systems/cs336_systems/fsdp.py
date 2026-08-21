@@ -34,11 +34,12 @@ class ParamState:
 
     # dynamic
     sharded_data: torch.Tensor | None = None  # for swap purpose
-
     all_gather_handle = None
     all_gather_data: torch.Tensor | None = None
-
     grad_handle = None
+
+    flat_grad: torch.Tensor | None = None
+    orig_grad: torch.Tensor | None = None
 
 
 class ModuleInfo:
@@ -113,15 +114,9 @@ class FSDPModule(torch.nn.Module):
                 for param in module.parameters(recurse=False):
                     self.param_states[param] = ParamState(is_shardable=False)
 
-    # TODO #2
-    # 1. [ ] record fwd and prefetch
-    # 2. [ ] reocrd bwd and prefetch
-    # 3. [ ] pre-fwd all gather weights
-    # 4. [ ] post-fwd release weights
-    # 5. [ ] pre-bwd all gather weights
-    # 6. [ ] post-bwd reduce-scatter gradients
-    # 7. [ ] post-bwd release weights
-    # 8. [ ] compute_dtype support
+    # TODO
+    # [ ] debug
+    # [ ] compute_dtype support
     def attach_fsdp_hooks(self):
         self.module_infos: dict[torch.nn.Module, ModuleInfo] = {}
 
@@ -261,14 +256,20 @@ class FSDPModule(torch.nn.Module):
                         ps = self.param_states[p]
                         orig_grad = p.grad
                         p.grad.div_(self.world_size)
+
                         flat_grad = p.grad.detach().flatten()
                         if ps.pad_size > 0:
                             flat_grad = torch.cat([flat_grad, torch.zeros(ps.pad_size, dtype=p.grad.dtype, device=p.grad.device)])
                         p.grad = torch.empty(ps.shard_size, dtype=p.grad.dtype, device=p.grad.device)
-                        dist.reduce_scatter_tensor(output=p.grad, input=flat_grad, op=dist.ReduceOp.SUM)
+                        # TODO: sync
+                        # dist.reduce_scatter_tensor(output=p.grad, input=flat_grad, op=dist.ReduceOp.SUM, async_op=True)
 
-                        free(flat_grad)
-                        free(orig_grad)
+                        ps.grad_handle = dist.reduce_scatter_tensor(output=p.grad, input=flat_grad, op=dist.ReduceOp.SUM, async_op=True)
+                        ps.flat_grad = flat_grad
+                        ps.orig_grad = orig_grad
+
+                        # free(flat_grad)
+                        # free(orig_grad)
 
                     return hook
 
@@ -298,9 +299,8 @@ class FSDPModule(torch.nn.Module):
         for mod in self.fwd_prefetches:
             for param in mod.parameters(recurse=False):
                 ps = self.param_states[param]
-
                 ps.all_gather_data = torch.empty(self.world_size * ps.shard_size, dtype=param.dtype, device=param.device)
-                dist.all_gather_into_tensor(ps.all_gather_data, param.data, async_op=True)  # sync
+                ps.all_gather_handle = dist.all_gather_into_tensor(ps.all_gather_data, param.data, async_op=True)
 
         return self.module(*inputs, **kwargs)
 
@@ -309,3 +309,5 @@ class FSDPModule(torch.nn.Module):
             if param_state.grad_handle is not None:
                 param_state.grad_handle.wait()
                 param_state.grad_handle = None
+                free(param_state.flat_grad)
+                free(param_state.orig_grad)
