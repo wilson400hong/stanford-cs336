@@ -165,7 +165,7 @@ class FSDPModule(torch.nn.Module):
                             orig_data = param.data
                             param.data = ps.sharded_data
                             ps.sharded_data = None
-                            free(orig_data)
+                            # free(orig_data)  # TODO
 
                         mi = self.module_infos[m]
                         if mi.first_fwd:
@@ -311,3 +311,17 @@ class FSDPModule(torch.nn.Module):
                 param_state.grad_handle = None
                 free(param_state.flat_grad)
                 free(param_state.orig_grad)
+
+    def gather_full_params(self) -> dict[str, torch.Tensor]:
+        res = {}
+        for name, param in self.module.named_parameters():
+            ps = self.param_states[param]
+            if ps.is_shardable:
+                # all_gather
+                gathered_data = torch.empty(self.world_size * ps.shard_size, dtype=param.dtype, device=param.device)
+                dist.all_gather_into_tensor(gathered_data, param.data, async_op=False)  # sync
+                assert ps.shape is not None
+                res[name] = gathered_data[: ps.numel].reshape(ps.shape)
+            else:
+                res[name] = param.data
+        return res
