@@ -1,5 +1,5 @@
 """
-FSDP use untyped_storage.resize() to truly release memory of Tensors that are saved by Autograd
+Naive implementaiton, But it does not really save param memory added by Autograd
 """
 
 from dataclasses import dataclass
@@ -7,6 +7,7 @@ import torch
 import torch.distributed as dist
 
 from cs336_basics.model import Embedding, Linear
+
 
 SHARDED_MODULE_TYPES = (Embedding, Linear)
 
@@ -22,6 +23,10 @@ def free(data: torch.Tensor | None):
         data.untyped_storage().resize_(0)
 
 
+def get_pad_size(size: int, world_size: int) -> int:
+    return (world_size - (size % world_size)) % world_size
+
+
 @dataclass
 class ParamState:
     # static
@@ -32,22 +37,16 @@ class ParamState:
     shard_size: int = 0
 
     # dynamic
-    sharded_data: torch.Tensor | None = None  # for swap purpose
+    sharded_data: torch.Tensor | None = None
     all_gather_handle = None
-    all_gather_data: torch.Tensor | None = None
+    all_gather_data: torch.Tensor | None = None  # should be compute_dtype
     grad_handle = None
-
     flat_grad: torch.Tensor | None = None
-    orig_grad: torch.Tensor | None = None
-
-    # ADDED FOR BUG FIX: A persistent tensor object for Autograd to hold
-    full_tensor_view: torch.Tensor | None = None
-    # full_param_data: torch.Tensor | None = None
 
 
 @dataclass
 class ModuleInfo:
-    """For FSDP Modules"""
+    """For sharded Modules"""
 
     first_fwd: bool = True
     first_bwd: bool = True
@@ -60,6 +59,7 @@ class FSDPModule(torch.nn.Module):
         super().__init__()
 
         self.module = module
+        self.storage_dtype = torch.float32  # hardcode now
         self.compute_dtype = compute_dtype
 
         if not dist.is_initialized():
@@ -72,7 +72,7 @@ class FSDPModule(torch.nn.Module):
         self.attach_fsdp_hooks()
 
     def sync_module(self):
-        self.rank0_print("sync module, broadcast params...")
+        self.rank0_print("Syncing module...")
         for param in self.module.parameters():
             dist.broadcast(param.data, src=0)
         for buffer in self.module.buffers():
@@ -82,44 +82,41 @@ class FSDPModule(torch.nn.Module):
         """
         Build ParamStates for each shardable param
         """
+        self.rank0_print("Sharding params...")
         self.param_states: dict[torch.nn.Parameter, ParamState] = {}
         for module in self.module.modules():
             if is_shardable(module):
-                for param in module.parameters(recurse=False):
+                for pname, param in module.named_parameters(recurse=False):
                     orig_size = param.untyped_storage().size()
                     # flat & padding
-                    orig_data = param.data
-                    flat_data = orig_data.detach().flatten()
-                    pad_size = (self.world_size - (flat_data.numel() % self.world_size)) % self.world_size
+                    # orig_data = param.data
+                    flat_data = param.data.detach().flatten()
+                    pad_size = get_pad_size(size=flat_data.numel(), world_size=self.world_size)
                     if pad_size > 0:
                         flat_data = torch.cat([flat_data, torch.zeros(pad_size, dtype=flat_data.dtype, device=flat_data.device)])
 
-                    # shard
+                    # sharding
                     shard_size = flat_data.numel() // self.world_size
+                    self.param_states[param] = ParamState(is_shardable=True, shape=param.shape, numel=param.numel(), pad_size=pad_size, shard_size=shard_size)
                     start_idx = self.rank * shard_size
                     end_idx = start_idx + shard_size
                     sharded_data = flat_data[start_idx:end_idx].clone()
 
-                    # param infos
-                    self.param_states[param] = ParamState(is_shardable=True, shape=param.shape, numel=param.numel(), pad_size=pad_size, shard_size=shard_size)
-
                     # swap data and release
                     param.data = sharded_data
                     free(flat_data)
-                    free(orig_data)
+                    # free(orig_data)
 
                     after_size = param.untyped_storage().size()
-                    print(f"Size comparison {orig_size=}   {after_size=}")
+                    print(f"Size comparison {pname=}  {orig_size=}  {after_size=}")
             else:
                 for param in module.parameters(recurse=False):
                     self.param_states[param] = ParamState(is_shardable=False)
 
     def attach_fsdp_hooks(self):
         self.module_infos: dict[torch.nn.Module, ModuleInfo] = {}
-
         self.fwd_modules = []
         self.bwd_modules = []
-
         self.fwd_prefetches = []  # use in top forward
 
         for mod in self.module.modules():
@@ -136,20 +133,20 @@ class FSDPModule(torch.nn.Module):
                             if ps.all_gather_handle is not None:
                                 ps.all_gather_handle.wait()
                                 ps.all_gather_handle = None
-                            else:
-                                # If missing, do all_gather on params
-                                ps.all_gather_data = torch.empty(self.world_size * ps.shard_size, dtype=param.dtype, device=param.device)
-                                dist.all_gather_into_tensor(ps.all_gather_data, param.data, async_op=False)  # sync
+                            else:  # If missing, do all_gather on params
+                                if isinstance(m, Linear):
+                                    ps.all_gather_data = torch.empty(self.world_size * ps.shard_size, dtype=self.compute_dtype, device=param.device)  # TODO: check
+                                    dist.all_gather_into_tensor(ps.all_gather_data, param.data.to(self.compute_dtype), async_op=False)  # sync
+                                else:  # Embedding
+                                    ps.all_gather_data = torch.empty(self.world_size * ps.shard_size, dtype=param.dtype, device=param.device)  # TODO: check
+                                    dist.all_gather_into_tensor(ps.all_gather_data, param.data, async_op=False)  # sync
 
+                            # ps.all_gather_data needs unpad and unflaten
                             ps.sharded_data = param.data
-
-                            # CRITICAL FIX: Repopulate storage of the persistent tensor using .set_()
-                            assert ps.all_gather_data is not None
+                            param.data = ps.all_gather_data  # compute_dtype now
+                            assert param.data is not None
                             assert ps.shape is not None
-                            # CREATE AND SAVE THE VIEW TENSOR AUTOGRAD WILL USE
-                            ps.full_tensor_view = ps.all_gather_data[: ps.numel].view(ps.shape)
-                            param.data = ps.full_tensor_view
-
+                            param.data = param.data[: ps.numel].reshape(ps.shape)
                             ps.all_gather_data = None
 
                     return hook
@@ -163,17 +160,12 @@ class FSDPModule(torch.nn.Module):
                         for param in m.parameters(recurse=False):
                             ps = self.param_states[param]
                             orig_data = param.data
-                            param.data = ps.sharded_data
+                            param.data = ps.sharded_data  # storage_type now
                             ps.sharded_data = None
-
-                            # THIS NOW WORKS! It resizes the storage of ps.full_param_data to 0
-                            free(orig_data)
-
-                        print(self.rank, "fwd_post freed", type(m).__name__)
+                            # free(orig_data)  # TODO BUG: cannot release memory due to Autograd
 
                         mi = self.module_infos[m]
-                        if mi.first_fwd:
-                            # record ordering in fwd_modules
+                        if mi.first_fwd:  # record for first fwd
                             mi.first_fwd = False
                             idx = len(self.fwd_modules)
                             if idx > 1:
@@ -187,8 +179,12 @@ class FSDPModule(torch.nn.Module):
                             if pm is not None:
                                 for p in pm.parameters(recurse=False):
                                     pps = self.param_states[p]
-                                    pps.all_gather_data = torch.empty(self.world_size * pps.shard_size, dtype=p.dtype, device=p.device)
-                                    pps.all_gather_handle = dist.all_gather_into_tensor(pps.all_gather_data, p.data, async_op=True)  # async
+                                    if isinstance(pm, Linear):
+                                        pps.all_gather_data = torch.empty(self.world_size * pps.shard_size, dtype=self.compute_dtype, device=p.device)  # TODO: check
+                                        pps.all_gather_handle = dist.all_gather_into_tensor(pps.all_gather_data, p.data.to(self.compute_dtype), async_op=True)  # async
+                                    else:  # Embedding
+                                        pps.all_gather_data = torch.empty(self.world_size * pps.shard_size, dtype=p.dtype, device=p.device)
+                                        pps.all_gather_handle = dist.all_gather_into_tensor(pps.all_gather_data, p.data, async_op=True)  # async
 
                     return hook
 
@@ -199,36 +195,25 @@ class FSDPModule(torch.nn.Module):
                     def hook(m, grad_output):
                         for param in m.parameters(recurse=False):
                             ps = self.param_states[param]
-                            # print(
-                            #     self.rank,
-                            #     "bwd_pre",
-                            #     type(m).__name__,
-                            #     "storage before:",
-                            #     ps.full_tensor_view.untyped_storage().size() if ps.full_tensor_view is not None else "None",
-                            # )
-                            padded_numel = self.world_size * ps.shard_size
-
                             # wait all_gather handle
                             if ps.all_gather_handle is not None:
                                 ps.all_gather_handle.wait()
                                 ps.all_gather_handle = None
-                            else:
-                                # 1. REVIVE THE STORAGE OF THE TENSOR AUTOGRAD SAVED
-                                bytes_per_element = param.element_size()
-                                assert ps.full_tensor_view is not None
-                                ps.full_tensor_view.untyped_storage().resize_(padded_numel * bytes_per_element)
+                            else:  # If missing, do all_gather on params
+                                if isinstance(m, Linear):
+                                    ps.all_gather_data = torch.empty(self.world_size * ps.shard_size, dtype=self.compute_dtype, device=param.device)  # TODO: check
+                                    dist.all_gather_into_tensor(ps.all_gather_data, param.data.to(self.compute_dtype), async_op=False)  # sync
+                                else:  # Embedding
+                                    ps.all_gather_data = torch.empty(self.world_size * ps.shard_size, dtype=param.dtype, device=param.device)  # TODO: check
+                                    dist.all_gather_into_tensor(ps.all_gather_data, param.data, async_op=False)  # sync
 
-                                # 2. Create a flat 1D wrapper pointing to this revived storage
-                                flat_padded = torch.empty(0, dtype=param.dtype, device=param.device)
-                                flat_padded.set_(ps.full_tensor_view.untyped_storage(), 0, (padded_numel,))
-
-                                # 3. Gather directly into the revived storage!
-                                dist.all_gather_into_tensor(flat_padded, param.data, async_op=False)
-
+                            # ps.all_gather_data needs unpad and unflaten
                             ps.sharded_data = param.data
-                            param.data = ps.full_tensor_view
-
-                            # print(self.rank, "bwd_pre revived", type(m).__name__, "storage after:", ps.full_tensor_view.untyped_storage().size())
+                            param.data = ps.all_gather_data
+                            assert param.data is not None
+                            assert ps.shape is not None
+                            param.data = param.data[: ps.numel].reshape(ps.shape)
+                            ps.all_gather_data = None
 
                     return hook
 
@@ -239,8 +224,7 @@ class FSDPModule(torch.nn.Module):
                     def hook(m, inp, out):
                         """Only do record and prefetch. Sharding is done in grad hook"""
                         mi = self.module_infos[m]
-                        if mi.first_bwd:
-                            # record ordering in bwd_modules
+                        if mi.first_bwd:  # record for first bwd
                             mi.first_bwd = False
                             idx = len(self.bwd_modules)
                             if idx > 1:
@@ -252,18 +236,12 @@ class FSDPModule(torch.nn.Module):
                             if pm is not None:
                                 for p in pm.parameters(recurse=False):
                                     pps = self.param_states[p]
-                                    padded_numel = self.world_size * pps.shard_size
-
-                                    # Revive storage for the prefetch
-                                    bytes_per_element = p.element_size()
-                                    assert pps.full_tensor_view is not None
-                                    pps.full_tensor_view.untyped_storage().resize_(padded_numel * bytes_per_element)
-
-                                    flat_padded = torch.empty(0, dtype=p.dtype, device=p.device)
-                                    flat_padded.set_(pps.full_tensor_view.untyped_storage(), 0, (padded_numel,))
-
-                                    # Async gather into the revived storage
-                                    pps.all_gather_handle = dist.all_gather_into_tensor(flat_padded, p.data, async_op=True)
+                                    if isinstance(pm, Linear):
+                                        pps.all_gather_data = torch.empty(self.world_size * pps.shard_size, dtype=self.compute_dtype, device=p.device)  # TODO: check
+                                        pps.all_gather_handle = dist.all_gather_into_tensor(pps.all_gather_data, p.data.to(self.compute_dtype), async_op=True)  # async
+                                    else:  # Embedding
+                                        pps.all_gather_data = torch.empty(self.world_size * pps.shard_size, dtype=p.dtype, device=p.device)
+                                        pps.all_gather_handle = dist.all_gather_into_tensor(pps.all_gather_data, p.data, async_op=True)  # async
 
                     return hook
 
@@ -271,32 +249,27 @@ class FSDPModule(torch.nn.Module):
 
                 def make_grad_hook():
                     def hook(p):
-                        # swap param.data, and release orig data
                         ps = self.param_states[p]
+
+                        # TODO: shape mismatch
+                        # swap param.data, and release orig data
                         orig_data = p.data
                         p.data = ps.sharded_data
                         ps.sharded_data = None
-
-                        # Resizes the storage of ps.full_param_data to 0 again!
                         free(orig_data)
 
                         # reduce scatter gradient
-                        ps = self.param_states[p]
-                        orig_grad = p.grad
-                        p.grad.div_(self.world_size)
+                        # grad need to be storage_dtype
+                        grad = p.grad.to(self.storage_dtype)
+                        grad.div_(self.world_size)
 
-                        flat_grad = p.grad.detach().flatten()
+                        ps.flat_grad = grad.detach().flatten()
                         if ps.pad_size > 0:
-                            flat_grad = torch.cat([flat_grad, torch.zeros(ps.pad_size, dtype=p.grad.dtype, device=p.grad.device)])
-                        p.grad = torch.empty(ps.shard_size, dtype=p.grad.dtype, device=p.grad.device)
+                            ps.flat_grad = torch.cat([ps.flat_grad, torch.zeros(ps.pad_size, dtype=grad.dtype, device=grad.device)])
+                        p.grad = torch.empty(ps.shard_size, dtype=grad.dtype, device=grad.device)  # need to match p.data shape!
 
-                        ps.grad_handle = dist.reduce_scatter_tensor(output=p.grad, input=flat_grad, op=dist.ReduceOp.SUM, async_op=True)
-                        ps.flat_grad = flat_grad
-                        ps.orig_grad = orig_grad
-
-                        # Leave these commented out! They must stay alive until wait() is called
-                        # free(flat_grad)
-                        # free(orig_grad)
+                        ps.grad_handle = dist.reduce_scatter_tensor(output=p.grad, input=ps.flat_grad, op=dist.ReduceOp.SUM, async_op=True)
+                        # ps.flat_grad = flat_grad
 
                     return hook
 
@@ -322,22 +295,33 @@ class FSDPModule(torch.nn.Module):
             print(msg)
 
     def forward(self, *inputs, **kwargs):
-        # prefetch L0, L1 if has
-        for mod in self.fwd_prefetches:
-            for param in mod.parameters(recurse=False):
-                ps = self.param_states[param]
-                ps.all_gather_data = torch.empty(self.world_size * ps.shard_size, dtype=param.dtype, device=param.device)
-                ps.all_gather_handle = dist.all_gather_into_tensor(ps.all_gather_data, param.data, async_op=True)
+        # prefetch first two layers
+        for pm in self.fwd_prefetches:  # must be shardable: (Linear, Embedding)
+            for p in mod.parameters(recurse=False):
+                pps = self.param_states[p]
+                self.compute_dtype
+                # TODO: check
+                # ps.all_gather_data = torch.empty(self.world_size * ps.shard_size, dtype=param.dtype, device=param.device)
+                 if isinstance(pm, Linear):
+                    pps.all_gather_data = torch.empty(self.world_size * ps.shard_size, dtype=self.compute_dtype, device=p.device)
+                    pps.all_gather_handle = dist.all_gather_into_tensor(ps.all_gather_data, p.data.to(self.compute_dtype), async_op=True)
+                else:  # Embedding
+                    pps.all_gather_data = torch.empty(self.world_size * pps.shard_size, dtype=p.dtype, device=p.device)
+                    pps.all_gather_handle = dist.all_gather_into_tensor(pps.all_gather_data, p.data, async_op=True)  # async
 
+               
         return self.module(*inputs, **kwargs)
 
     def finish_gradient_synchronization(self):
-        for param_state in self.param_states.values():
-            if param_state.grad_handle is not None:
-                param_state.grad_handle.wait()
-                param_state.grad_handle = None
-                free(param_state.flat_grad)
-                free(param_state.orig_grad)
+        for param, ps in self.param_states.items():
+            if ps.grad_handle is not None:
+                ps.grad_handle.wait()
+                ps.grad_handle = None
+                assert param.grad is not None
+                # param.grad = param.grad.to(self.storage_dtype)  # TODO: check
+                free(ps.flat_grad)
+                ps.flat_grad = None
+                # free(ps.orig_grad)
 
     def gather_full_params(self) -> dict[str, torch.Tensor]:
         res = {}
