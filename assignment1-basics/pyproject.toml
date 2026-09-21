@@ -38,6 +38,10 @@ log_cli = true
 log_cli_level = "WARNING"
 addopts = "-s"
 
+[tool.black]
+# black defaults to 88; VS Code's format-on-save picks this up automatically.
+line-length = 120
+
 [tool.ruff]
 line-length = 120
 

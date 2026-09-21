@@ -136,7 +136,7 @@ class FSDPModule(torch.nn.Module):
                 for param in module.parameters(recurse=False):
                     self.param_states[param] = ParamState(is_shardable=False)
 
-    def gather_param(
+    def gather_param_state_data(
         self, mod: torch.nn.Module, param: torch.nn.Parameter, async_op: bool
     ):
         """
@@ -147,7 +147,9 @@ class FSDPModule(torch.nn.Module):
         ps.all_gather_data = torch.empty(
             self.world_size * ps.shard_size, dtype=dtype, device=param.device
         )
-        dist.all_gather_into_tensor(ps.all_gather_data, param.data, async_op=async_op)
+        dist.all_gather_into_tensor(
+            ps.all_gather_data, param.data.to(dtype), async_op=async_op
+        )
 
     def attach_fsdp_hooks(self):
         self.module_infos: dict[torch.nn.Module, ModuleInfo] = {}
@@ -161,16 +163,16 @@ class FSDPModule(torch.nn.Module):
                     self.module_infos[mod] = ModuleInfo()
 
                 ####### pre foward
-                def make_fwd_pre(dt):
+                def make_fwd_pre():
                     def hook(mod, inp):
-                        for param in m.parameters(recurse=False):
+                        for param in mod.parameters(recurse=False):
                             ps = self.param_states[param]
                             # wait all_gather handle
                             if ps.all_gather_handle is not None:
                                 ps.all_gather_handle.wait()
                                 ps.all_gather_handle = None
                             else:  # If missing, do all_gather on params
-                                self.gather_param(mod, param, async_op=False)
+                                self.gather_param_state_data(mod, param, async_op=False)
                             # ps.all_gather_data needs unpad and unflaten
                             ps.sharded_data = param.data
                             param.data = ps.all_gather_data  # compute_dtype now
@@ -181,36 +183,38 @@ class FSDPModule(torch.nn.Module):
 
                     return hook
 
-                mod.register_forward_pre_hook(make_fwd_pre(self.compute_dtype))
+                mod.register_forward_pre_hook(make_fwd_pre())
 
                 ####### post forward
                 def make_fwd_post():
-                    def hook(m, inp, out):
+                    def hook(mod, inp, out):
                         # swap param.data, and release orig data
-                        for param in m.parameters(recurse=False):
+                        for param in mod.parameters(recurse=False):
                             ps = self.param_states[param]
                             orig_data = param.data
                             param.data = ps.sharded_data  # storage_type now
                             ps.sharded_data = None
                             # free(orig_data)  # TODO BUG: cannot release memory due to Autograd
 
-                        mi = self.module_infos[m]
+                        mi = self.module_infos[mod]
                         if mi.first_fwd:  # record for first fwd
                             mi.first_fwd = False
                             idx = len(self.fwd_modules)
                             if idx > 1:
                                 self.module_infos[
                                     self.fwd_modules[idx - 2]
-                                ].fwd_prefetch = m
+                                ].fwd_prefetch = mod
                             else:
-                                self.fwd_prefetches.append(m)
-                            self.fwd_modules.append(m)
+                                self.fwd_prefetches.append(mod)
+                            self.fwd_modules.append(mod)
                         else:
                             # prefetch
                             pmod = mi.fwd_prefetch
                             if pmod is not None:
                                 for param in pmod.parameters(recurse=False):
-                                    self.gather_param(pmod, param, async_op=True)
+                                    self.gather_param_state_data(
+                                        pmod, param, async_op=True
+                                    )
 
                     return hook
 
@@ -218,15 +222,15 @@ class FSDPModule(torch.nn.Module):
 
                 ####### pre backward
                 def make_bwd_pre(dt):
-                    def hook(m, grad_output):
-                        for param in m.parameters(recurse=False):
+                    def hook(mod, grad_output):
+                        for param in mod.parameters(recurse=False):
                             ps = self.param_states[param]
                             # wait all_gather handle
                             if ps.all_gather_handle is not None:
                                 ps.all_gather_handle.wait()
                                 ps.all_gather_handle = None
                             else:  # If missing, do all_gather on params
-                                self.gather_param(mod, param, async_op=True)
+                                self.gather_param_state_data(mod, param, async_op=False)
 
                             # ps.all_gather_data needs unpad and unflaten
                             ps.sharded_data = param.data
@@ -242,23 +246,34 @@ class FSDPModule(torch.nn.Module):
 
                 ####### post backward
                 def make_bwd_post(dt):
-                    def hook(m, inp, out):
+                    def hook(mod, inp, out):
                         """Only do record and prefetch. Sharding is done in grad hook"""
-                        mi = self.module_infos[m]
+                        # TODO: shape mismatch ??
+                        for param in mod.parameters(recurse=False):
+                            ps = self.param_states[param]
+                            # swap param.data, and release orig data
+                            orig_data = param.data
+                            param.data = ps.sharded_data
+                            ps.sharded_data = None
+                            free(orig_data)
+
+                        mi = self.module_infos[mod]
                         if mi.first_bwd:  # record for first bwd
                             mi.first_bwd = False
                             idx = len(self.bwd_modules)
                             if idx > 1:
                                 self.module_infos[
                                     self.bwd_modules[idx - 2]
-                                ].bwd_prefetch = m
-                            self.bwd_modules.append(m)
+                                ].bwd_prefetch = mod
+                            self.bwd_modules.append(mod)
                         else:
                             # prefetch
                             pmod = mi.bwd_prefetch  # prefetch module
                             if pmod is not None:
                                 for param in pmod.parameters(recurse=False):
-                                    self.gather_param(pmod, param, async_op=True)
+                                    self.gather_param_state_data(
+                                        pmod, param, async_op=True
+                                    )
 
                     return hook
 
@@ -267,14 +282,6 @@ class FSDPModule(torch.nn.Module):
                 def make_grad_hook():
                     def hook(p):
                         ps = self.param_states[p]
-
-                        # TODO: shape mismatch
-                        # swap param.data, and release orig data
-                        orig_data = p.data
-                        p.data = ps.sharded_data
-                        ps.sharded_data = None
-                        free(orig_data)
-
                         # reduce scatter gradient
                         # grad need to be storage_dtype
                         grad = p.grad.to(
@@ -333,28 +340,9 @@ class FSDPModule(torch.nn.Module):
 
     def forward(self, *inputs, **kwargs):
         # prefetch first two layers
-        for pm in self.fwd_prefetches:  # must be shardable: (Linear, Embedding)
-            for p in mod.parameters(recurse=False):
-                pps = self.param_states[p]
-                self.compute_dtype
-                # TODO: check
-                # ps.all_gather_data = torch.empty(self.world_size * ps.shard_size, dtype=param.dtype, device=param.device)
-                if isinstance(pm, Linear):
-                    pps.all_gather_data = torch.empty(
-                        self.world_size * ps.shard_size,
-                        dtype=self.compute_dtype,
-                        device=p.device,
-                    )
-                    pps.all_gather_handle = dist.all_gather_into_tensor(
-                        ps.all_gather_data, p.data.to(self.compute_dtype), async_op=True
-                    )
-                else:  # Embedding
-                    pps.all_gather_data = torch.empty(
-                        self.world_size * pps.shard_size, dtype=p.dtype, device=p.device
-                    )
-                    pps.all_gather_handle = dist.all_gather_into_tensor(
-                        pps.all_gather_data, p.data, async_op=True
-                    )  # async
+        for mod in self.fwd_prefetches:  # must be shardable: (Linear, Embedding)
+            for param in mod.parameters(recurse=False):
+                self.gather_param_state_data(mod, param, async_op=True)
 
         return self.module(*inputs, **kwargs)
 

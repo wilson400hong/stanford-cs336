@@ -15,5 +15,17 @@
   "python.analysis.typeCheckingMode": "off",
   "python.languageServer": "Default",
   "python.experiments.enabled": false,
-  "pyls.automaticWorkspaceOverrides": false
+  "pyls.automaticWorkspaceOverrides": false,
+  // This repo is not an fbsource/arc project, but nuclide.arclint still registers
+  // itself as the Python formatter and runs /usr/local/bin/pyfmt (black @ 88) on
+  // save, which reverts any wider formatting. pyfmt has no line-length option
+  // outside fbsource, so turn format-on-save off here and format with the venv's
+  // ruff instead (`uv run ruff format`, honors [tool.ruff] line-length = 120).
+  "[python]": {
+    "editor.formatOnSave": false,
+    "editor.rulers": [120]
+  },
+  "arclint.formatOnSave": {
+    "python": false
+  }
 }

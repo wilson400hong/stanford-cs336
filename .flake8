@@ -1,0 +1,11 @@
+[flake8]
+# Match [tool.ruff] line-length in the assignment pyproject.toml files.
+max-line-length = 120
+# E203/W503 conflict with black/ruff-format's slicing and line-break style.
+extend-ignore = E203, W503
+exclude =
+    .git,
+    .venv,
+    __pycache__,
+    build,
+    dist
