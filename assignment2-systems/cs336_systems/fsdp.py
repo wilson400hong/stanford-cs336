@@ -20,16 +20,19 @@ def use_compute_dtype(module: torch.nn.Module) -> bool:
     return isinstance(module, Linear)
 
 
-def free(data: torch.Tensor | None):
+def free_tensor(data: torch.Tensor | None):
     if data is None:
         return
     if data.untyped_storage().size() > 0:
         data.untyped_storage().resize_(0)
 
 
-def get_pad_size(size: int, world_size: int) -> int:
-    return (world_size - (size % world_size)) % world_size
+def get_pad_size(data_size: int, world_size: int) -> int:
+    return (world_size - (data_size % world_size)) % world_size
 
+
+def pad_tensor(data: torch.Tensor, pad_size: int):
+    return torch.cat([data, torch.zeros(pad_size, dtype=data.dtype, device=data.device)])
 
 @dataclass
 class ParamState:
@@ -64,18 +67,21 @@ class FSDPModule(torch.nn.Module):
     ):
         super().__init__()
 
-        self.module = module
-        self.storage_dtype = torch.float32  # hardcode now
-        self.compute_dtype = compute_dtype
-
         if not dist.is_initialized():
             raise RuntimeError("torch distributed not initialized")
 
+        self.module = module
+        self.storage_dtype = torch.float32  # TODO: hardcode now
+        self.compute_dtype = compute_dtype
         self.world_size = dist.get_world_size()
         self.rank = dist.get_rank()
         self.sync_module()
         self.shard_params()
         self.attach_fsdp_hooks()
+
+    def rank0_print(self, msg):
+        if self.rank == 0:
+            print(msg)
 
     def sync_module(self):
         self.rank0_print("Syncing module...")
@@ -95,22 +101,10 @@ class FSDPModule(torch.nn.Module):
                 for pname, param in module.named_parameters(recurse=False):
                     orig_size = param.untyped_storage().size()
                     # flat & padding
-                    # orig_data = param.data
                     flat_data = param.data.detach().flatten()
-                    pad_size = get_pad_size(
-                        size=flat_data.numel(), world_size=self.world_size
-                    )
+                    pad_size = get_pad_size(data_size=flat_data.numel(), world_size=self.world_size)
                     if pad_size > 0:
-                        flat_data = torch.cat(
-                            [
-                                flat_data,
-                                torch.zeros(
-                                    pad_size,
-                                    dtype=flat_data.dtype,
-                                    device=flat_data.device,
-                                ),
-                            ]
-                        )
+                        flat_data = pad_tensor(flat_data, pad_size)
 
                     # sharding
                     shard_size = flat_data.numel() // self.world_size
@@ -125,10 +119,8 @@ class FSDPModule(torch.nn.Module):
                     end_idx = start_idx + shard_size
                     sharded_data = flat_data[start_idx:end_idx].clone()
 
-                    # swap data and release
                     param.data = sharded_data
-                    free(flat_data)
-                    # free(orig_data)
+                    free_tensor(flat_data)  
 
                     after_size = param.untyped_storage().size()
                     print(f"Size comparison {pname=}  {orig_size=}  {after_size=}")
@@ -144,12 +136,8 @@ class FSDPModule(torch.nn.Module):
         """
         ps = self.param_states[param]
         dtype = self.compute_dtype if use_compute_dtype(mod) else param.dtype
-        ps.all_gather_data = torch.empty(
-            self.world_size * ps.shard_size, dtype=dtype, device=param.device
-        )
-        dist.all_gather_into_tensor(
-            ps.all_gather_data, param.data.to(dtype), async_op=async_op
-        )
+        ps.all_gather_data = torch.empty(self.world_size * ps.shard_size, dtype=dtype, device=param.device)
+        dist.all_gather_into_tensor(ps.all_gather_data, param.data.to(dtype), async_op=async_op)
 
     def attach_fsdp_hooks(self):
         self.module_infos: dict[torch.nn.Module, ModuleInfo] = {}
@@ -158,10 +146,10 @@ class FSDPModule(torch.nn.Module):
         self.fwd_prefetches = []  # use in top forward
 
         for mod in self.module.modules():
-            if is_shardable(mod):
-                if mod not in self.module_infos:
-                    self.module_infos[mod] = ModuleInfo()
+            if mod not in self.module_infos:
+                self.module_infos[mod] = ModuleInfo()
 
+            if is_shardable(mod):                
                 ####### pre foward
                 def make_fwd_pre():
                     def hook(mod, inp):
@@ -255,16 +243,14 @@ class FSDPModule(torch.nn.Module):
                             orig_data = param.data
                             param.data = ps.sharded_data
                             ps.sharded_data = None
-                            free(orig_data)
+                            free_tensor(orig_data)
 
                         mi = self.module_infos[mod]
                         if mi.first_bwd:  # record for first bwd
                             mi.first_bwd = False
                             idx = len(self.bwd_modules)
                             if idx > 1:
-                                self.module_infos[
-                                    self.bwd_modules[idx - 2]
-                                ].bwd_prefetch = mod
+                                self.module_infos[self.bwd_modules[idx - 2]].bwd_prefetch = mod
                             self.bwd_modules.append(mod)
                         else:
                             # prefetch
@@ -291,16 +277,17 @@ class FSDPModule(torch.nn.Module):
 
                         ps.flat_grad = grad.detach().flatten()
                         if ps.pad_size > 0:
-                            ps.flat_grad = torch.cat(
-                                [
-                                    ps.flat_grad,
-                                    torch.zeros(
-                                        ps.pad_size,
-                                        dtype=grad.dtype,
-                                        device=grad.device,
-                                    ),
-                                ]
-                            )
+                            ps.flat_grad = pad_tensor(ps.flat_grad, ps.pad_size)
+                            # ps.flat_grad = torch.cat(
+                            #     [
+                            #         ps.flat_grad,
+                            #         torch.zeros(
+                            #             ps.pad_size,
+                            #             dtype=grad.dtype,
+                            #             device=grad.device,
+                            #         ),
+                            #     ]
+                            # )
                         p.grad = torch.empty(
                             ps.shard_size, dtype=grad.dtype, device=grad.device
                         )  # need to match p.data shape!
@@ -334,12 +321,9 @@ class FSDPModule(torch.nn.Module):
                     if param.requires_grad:
                         param.register_post_accumulate_grad_hook(make_grad_hook())
 
-    def rank0_print(self, msg):
-        if self.rank == 0:
-            print(msg)
-
+   
     def forward(self, *inputs, **kwargs):
-        # prefetch first two layers
+        # prefetch params
         for mod in self.fwd_prefetches:  # must be shardable: (Linear, Embedding)
             for param in mod.parameters(recurse=False):
                 self.gather_param_state_data(mod, param, async_op=True)
@@ -353,7 +337,7 @@ class FSDPModule(torch.nn.Module):
                 ps.grad_handle = None
                 assert param.grad is not None
                 # param.grad = param.grad.to(self.storage_dtype)  # TODO: check
-                free(ps.flat_grad)
+                free_tensor(ps.flat_grad)
                 ps.flat_grad = None
                 # free(ps.orig_grad)
 
@@ -362,17 +346,14 @@ class FSDPModule(torch.nn.Module):
         for name, param in self.module.named_parameters():
             ps = self.param_states[param]
             if ps.is_shardable:
-                # all_gather
                 gathered_data = torch.empty(
                     self.world_size * ps.shard_size,
                     dtype=param.dtype,
                     device=param.device,
                 )
-                dist.all_gather_into_tensor(
-                    gathered_data, param.data, async_op=False
-                )  # sync
+                dist.all_gather_into_tensor(gathered_data, param.data, async_op=False)
                 assert ps.shape is not None
-                res[name] = gathered_data[: ps.numel].reshape(ps.shape)
+                res[name] = gathered_data[:ps.numel].reshape(ps.shape)
             else:
                 res[name] = param.data
         return res

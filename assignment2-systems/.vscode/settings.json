@@ -24,8 +24,5 @@
   "[python]": {
     "editor.formatOnSave": false,
     "editor.rulers": [120]
-  },
-  "arclint.formatOnSave": {
-    "python": false
   }
 }
