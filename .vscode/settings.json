@@ -3,10 +3,14 @@
     "editor.defaultFormatter": "charliermarsh.ruff",
     "editor.formatOnSave": true,
     "editor.rulers": [120],
-    "editor.wordWrap": "wordWrapColumn",
-    "editor.wordWrapColumn": 120
+    "editor.wordWrap": "off"
   },
   "ruff.lineLength": 120,
+  "python.languageServer": "Default",
+  "python.analysis.typeCheckingMode": "basic",
+  "python.analysis.diagnosticMode": "openFilesOnly",
+  "python.pyrefly.displayTypeErrors": "force-on",
+  "python.pyrefly.diagnosticMode": "openFilesOnly",
   "arclint.formatOnSave": {
     "python": false
   }
