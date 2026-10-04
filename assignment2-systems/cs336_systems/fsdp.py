@@ -93,7 +93,7 @@ class FSDPModule(torch.nn.Module):
         self.has_recorded_order = False
         self.fwd_execution_order: list[torch.nn.Module] = []
         self.next_fwd_mod: dict[torch.nn.Module, torch.nn.Module] = {}
-        self.next_bwd_linear: dict[torch.nn.Module, torch.nn.Module] = {}  # TODO: rename to next_bwd_module 
+        self.next_bwd_mod: dict[torch.nn.Module, torch.nn.Module] = {}
                 
         self._shard_params()
         self._attach_hooks()
@@ -214,9 +214,9 @@ class FSDPModule(torch.nn.Module):
 
                     # Backward prefetch
                     if self.has_recorded_order:
-                        prev_linear = self.next_bwd_linear.get(m)
-                        if prev_linear is not None:
-                            self._gather_module(prev_linear, async_op=True)
+                        nxt: torch.nn.Module | None = self.next_bwd_mod.get(m)
+                        if nxt is not None:
+                            self._gather_module(nxt, async_op=True)
 
                 mod.register_full_backward_pre_hook(bwd_pre)
 
@@ -277,9 +277,9 @@ class FSDPModule(torch.nn.Module):
                 self.next_fwd_mod[self.fwd_execution_order[i]] = self.fwd_execution_order[i+1]
 
             # bwd
-            linear_order = [m for m in self.fwd_execution_order if isinstance(m, Linear)]
-            for i in range(len(linear_order)-1, 0, -1):
-                self.next_bwd_linear[linear_order[i]] = linear_order[i-1]
+            # linear_order = [m for m in self.fwd_execution_order if isinstance(m, Linear)]
+            for i in range(len(self.fwd_execution_order)-1, 0, -1):
+                self.next_bwd_mod[self.fwd_execution_order[i]] = self.fwd_execution_order[i-1]
 
             self.has_recorded_order = True
        
