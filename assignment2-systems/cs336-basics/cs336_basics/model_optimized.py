@@ -9,11 +9,12 @@ import warnings
 import einx
 import torch
 import torch.nn as nn
+from cs336_basics.nn_utils import softmax
 from einops import einsum, rearrange
 from jaxtyping import Bool, Float, Int
 from torch import Tensor
-
-from cs336_basics.nn_utils import softmax
+from torch.utils.checkpoint import checkpoint
+import torch.cuda.nvtx as nvtx
 
 logger = logging.getLogger(__name__)
 
@@ -32,7 +33,8 @@ class Linear(nn.Module):
         super().__init__()
         std = math.sqrt(2 / (d_in + d_out))
         self.weight: Float[Tensor, " d_out d_in"] = nn.Parameter(
-            nn.init.trunc_normal_(torch.empty(d_out, d_in), std=std, a=-3 * std, b=3 * std), requires_grad=True
+            nn.init.trunc_normal_(torch.empty(d_out, d_in), std=std, a=-3 * std, b=3 * std),
+            requires_grad=True,
         )
 
     def forward(self, x: Float[Tensor, " ... d_in"]) -> Float[Tensor, " ... d_out"]:
@@ -47,7 +49,8 @@ class Embedding(nn.Module):
         super().__init__()
         std = 1.0
         self.weight = nn.Parameter(
-            nn.init.trunc_normal_(torch.empty(vocab_size, d_model), std=std, a=-3 * std, b=3 * std), requires_grad=True
+            nn.init.trunc_normal_(torch.empty(vocab_size, d_model), std=std, a=-3 * std, b=3 * std),
+            requires_grad=True,
         )
 
     def forward(self, token_ids: Int[Tensor, " ..."]) -> Float[Tensor, " ... d_model"]:
@@ -111,7 +114,9 @@ class RotaryEmbedding(nn.Module):
     def __init__(self, context_length: int, dim: int, theta: float = 10000.0):
         super().__init__()
         self.register_buffer(
-            "_freq_cis_cache", RotaryEmbedding._init_cache(context_length, dim, theta), persistent=False
+            "_freq_cis_cache",
+            RotaryEmbedding._init_cache(context_length, dim, theta),
+            persistent=False,
         )
         self._freq_cis_cache: Float[Tensor, "2 context_length half_dim"]
 
@@ -138,7 +143,11 @@ class RotaryEmbedding(nn.Module):
 
         # einx
         if pos_ids is not None:
-            cos, sin = einx.get_at("cos_sin [pos] half_dim, ... -> cos_sin ... half_dim", self._freq_cis_cache, pos_ids)
+            cos, sin = einx.get_at(
+                "cos_sin [pos] half_dim, ... -> cos_sin ... half_dim",
+                self._freq_cis_cache,
+                pos_ids,
+            )
         else:
             seq_len = x.size(-2)
             cos, sin = self._freq_cis_cache[:, :seq_len, :].unbind(0)
@@ -186,6 +195,8 @@ class BasicsTransformerLM(nn.Module):
         num_heads: int,
         d_ff: int,
         rope_theta: float | None = 10_000.0,
+        gradient_checkpointing: bool = False,
+        layer_chunk_size: int = 1,
     ):
         # Store the model configuration for serialization / deserialization
         self.config = {
@@ -199,18 +210,15 @@ class BasicsTransformerLM(nn.Module):
         self.positional_encoder = (
             RotaryEmbedding(context_length, d_head, rope_theta) if rope_theta is not None else None
         )
-
-        self.layers = nn.ModuleList(
+        self.num_layers = num_layers
+        self.layers = torch.nn.ModuleList(
             [
-                TransformerBlock(
-                    d_model=d_model,
-                    num_heads=num_heads,
-                    d_ff=d_ff,
-                    positional_encoder=self.positional_encoder,
-                )
+                TransformerBlock(d_model, num_heads, d_ff, self.positional_encoder, gradient_checkpointing)
                 for _ in range(num_layers)
             ]
         )
+        self.layer_chunk_size = layer_chunk_size
+        self.gradient_checkpointing = gradient_checkpointing
         self.ln_final = RMSNorm(d_model)
         self.lm_head = Linear(d_model, vocab_size)
         # Tie the weights, since the paper mentions that "we share the same weight
@@ -248,9 +256,21 @@ class BasicsTransformerLM(nn.Module):
         # x = self.positional_encoder(embedded_tokens, positions)
         x = embedded_tokens
 
-        for layer in self.layers:
-            # (batch size, sequence_length, d_model)
-            x = layer(x)
+        if self.gradient_checkpointing:
+            for offset in range(0, self.num_layers, self.layer_chunk_size):
+                chunk_layers = self.layers[offset : offset + self.layer_chunk_size]
+
+                def sub_forward(layers, h):
+                    for layer in layers:
+                        h = layer(h)
+                    return h
+
+                x = checkpoint(sub_forward, chunk_layers, x, use_reentrant=False)
+        else:
+            for layer in self.layers:
+                # (batch size, sequence_length, d_model)
+                x = layer(x)
+
         # (batch size, sequence_length, d_model)
         x = self.ln_final(x)
         # (batch size, sequence_length, vocab_size)
@@ -356,6 +376,7 @@ class TransformerBlock(nn.Module):
         num_heads: int,
         d_ff: int,
         positional_encoder: RotaryEmbedding | None,
+        gradient_checkpointing: bool = False,
     ):
         super().__init__()
         self.attn = CausalMultiHeadSelfAttention(
@@ -366,6 +387,7 @@ class TransformerBlock(nn.Module):
         self.ffn = SwiGLU(d_model=d_model, d_ff=d_ff)
         self.ln1 = RMSNorm(d_model)
         self.ln2 = RMSNorm(d_model)
+        self.gradient_checkpointing = gradient_checkpointing
 
     def forward(self, x: torch.Tensor):
         """
@@ -379,11 +401,18 @@ class TransformerBlock(nn.Module):
         # NOTE: this is a pre-norm Transformer, and differs from the original
         # description in the paper.
         # Apply the multi-head self-attention sublayer
-        x_attn = self.attn(self.ln1(x))
+        if self.gradient_checkpointing:
+            x_attn = checkpoint(self.attn, self.ln1(x), use_reentrant=False)
+        else:
+            x_attn = self.attn(self.ln1(x))
+
         attn_sublayer_output = x + x_attn
 
         # Apply the feed-forward sublayer
-        x_ffn = self.ffn(self.ln2(attn_sublayer_output))
+        if self.gradient_checkpointing:
+            x_ffn = checkpoint(self.ffn, self.ln2(attn_sublayer_output), use_reentrant=False)
+        else:
+            x_ffn = self.ffn(self.ln2(attn_sublayer_output))
         ffn_sublayer_output = attn_sublayer_output + x_ffn
         return ffn_sublayer_output
 
@@ -399,6 +428,7 @@ class SwiGLU(nn.Module):
         return self.w2(silu(self.w1(x)) * self.w3(x))
 
 
+# @nvtx.range("scaled dot product attention")
 def scaled_dot_product_attention(
     Q: Float[Tensor, " ... queries d_k"],
     K: Float[Tensor, " ... keys    d_k"],
@@ -423,14 +453,17 @@ def scaled_dot_product_attention(
         implementation with the provided key, query, and value tensors.
     """
 
+    # with nvtx.range("compute attention scores"):
     d_k = K.shape[-1]
     attention_scores = einsum(Q, K, "... query d_k, ... key d_k -> ... query key") / math.sqrt(d_k)
 
     if mask is not None:
         attention_scores = torch.where(mask, attention_scores, float("-inf"))
 
+    # with nvtx.range("compute softmax"):
     attention_weights = softmax(attention_scores, dim=-1)  # Softmax over the key dimension
 
+    # with nvtx.range("final matmul"):
     return einsum(attention_weights, V, "... query key, ... key d_v ->  ... query d_v")
 
 
@@ -478,7 +511,9 @@ class CausalMultiHeadSelfAttention(nn.Module):
         self.positional_encoder: RotaryEmbedding | None = positional_encoder  # RoPE
 
     def forward(
-        self, x: Float[Tensor, " ... seq d_k"], token_positions: Int[Tensor, " ... seq"] | None = None
+        self,
+        x: Float[Tensor, " ... seq d_k"],
+        token_positions: Int[Tensor, " ... seq"] | None = None,
     ) -> Float[Tensor, " ... seq d_v"]:
         """
         Args:

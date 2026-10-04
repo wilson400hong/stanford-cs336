@@ -1,5 +1,5 @@
 """
-Naive implementaiton, But it does not really save param memory added by Autograd
+FSDP implementation
 """
 
 from dataclasses import dataclass
@@ -208,7 +208,6 @@ class FSDPModule(torch.nn.Module):
 
                 # ----------------- 3. Backward Pre Hook -----------------
                 def bwd_pre(m, grad_out):
-                    # if isinstance(m, Linear):
                     self._gather_module(m, async_op=False)
                     self._wait_and_assign_module(m)
 
@@ -272,15 +271,9 @@ class FSDPModule(torch.nn.Module):
 
         # derive fwd / bwd ordering
         if not self.has_recorded_order:
-            # TODO: can use zip(x[:-1], x[1:])
-            for i in range(len(self.fwd_execution_order)-1):
-                self.next_fwd_mod[self.fwd_execution_order[i]] = self.fwd_execution_order[i+1]
-
-            # bwd
-            # linear_order = [m for m in self.fwd_execution_order if isinstance(m, Linear)]
-            for i in range(len(self.fwd_execution_order)-1, 0, -1):
-                self.next_bwd_mod[self.fwd_execution_order[i]] = self.fwd_execution_order[i-1]
-
+            for mod, nxt in zip(self.fwd_execution_order[:-1], self.fwd_execution_order[1:]):
+                self.next_fwd_mod[mod] = nxt
+                self.next_bwd_mod[nxt] = mod
             self.has_recorded_order = True
        
         return output

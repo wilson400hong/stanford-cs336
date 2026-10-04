@@ -13,5 +13,6 @@
   "python.pyrefly.diagnosticMode": "openFilesOnly",
   "arclint.formatOnSave": {
     "python": false
-  }
+  },
+  "python.REPL.enableREPLSmartSend": false
 }
